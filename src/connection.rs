@@ -141,6 +141,7 @@ fn parse_font_size(value: &str) -> std::result::Result<f32, String> {
 pub mod actions;
 pub mod keymap;
 pub mod perform;
+pub mod prompt;
 
 pub enum Command {
     Selection(crate::terminal::selection::Input),
@@ -455,6 +456,7 @@ impl HostModel {
     }
     fn forget_block(&mut self, block: &str) {
         self.activity.remove(block);
+        self.status_read.remove(block);
         self.programs.remove(block);
         self.executables.remove(block);
         self.scripts.remove(block);
@@ -710,18 +712,57 @@ impl ControlState {
         });
     }
 
+    fn forget_block(&mut self, block: &str) {
+        self.queried.remove(block);
+        self.status_queried.remove(block);
+        self.status_failed.remove(block);
+        self.status_reading.remove(block);
+        self.themed.remove(block);
+        self.tickets.retain(|(_, b), _| b != block);
+    }
+
+    fn forget_session(&mut self, id: &str, blocks: impl IntoIterator<Item = String>) {
+        self.view_seq.remove(id);
+        self.viewed.remove(id);
+        self.urgent_views.retain(|s| s != id);
+        if self.view_reading.as_deref() == Some(id) {
+            self.view_stale = true;
+        }
+        self.fetch_stale.remove(id);
+        self.tickets.retain(|(s, _), _| s != id);
+        for block in blocks {
+            self.forget_block(&block);
+        }
+    }
+
     fn includes(&self, event: &rexrs::Event) -> bool {
         let mut floor = self.bootstrap_seq;
-        if matches!(
-            event.name.as_str(),
-            "session_created" | "session_moved" | "session_destroyed" | "session_label_changed"
-        ) {
+        let event_type = if event.name == "event_dropped" {
+            event.payload["event_type"].as_str().unwrap_or("")
+        } else {
+            event.name.as_str()
+        };
+        let list_event = matches!(
+            event_type,
+            "session_created" | "session_moved" | "session_destroyed"
+        );
+        if list_event || event_type == "session_label_changed" {
             floor = floor.max(self.list_seq);
         }
-        // Views contain state, not transient clipboard events.
-        if event.name != "session_destroyed"
-            && !(event.name == "block_event" && clipboard::is_copy(&event.payload))
-            && let Some(id) = &event.session_id
+        // Views contain state, not transient clipboard events or list-level session events.
+        let session = event.session_id.as_deref().or_else(|| {
+            (event.name == "event_dropped")
+                .then(|| event.payload["session_id"].as_str())
+                .flatten()
+        });
+        let is_copy = event.name == "block_event" && clipboard::is_copy(&event.payload);
+        // `session.view` carries layout, not program status, title, or process metadata, so
+        // only `session_view_changed` drops are superseded by a newer `view_seq`.
+        let view_covered = event.name != "event_dropped" || event_type == "session_view_changed";
+        if !list_event
+            && !is_copy
+            && view_covered
+            && let Some(id) = session
         {
             floor = floor.max(self.view_seq.get(id).copied().unwrap_or(0));
         }
@@ -1100,24 +1141,55 @@ async fn refresh(
     apply_view(shared, id, reply.value);
     Ok(())
 }
-async fn list(control: &mut Client, shared: &Shared, state: &mut ControlState) -> Result<()> {
+async fn list(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+) -> Result<()> {
     let reply = tokio::time::timeout(
         Duration::from_secs(8),
         control.call_with_seq(session::AttachAll::new("all")),
     )
     .await??;
     state.list_seq = reply.seq;
+    let mut removed = Vec::<(String, Vec<String>)>::new();
     shared.update(|m| {
+        let prev_sessions: HashSet<String> =
+            m.sessions.iter().map(|s| s.session_id.clone()).collect();
         m.sessions = reply.value.sessions;
-        m.views
-            .retain(|id, _| m.sessions.iter().any(|s| &s.session_id == id));
-        if m.selected
-            .as_ref()
-            .is_some_and(|id| !m.sessions.iter().any(|s| &s.session_id == id))
-        {
+        let current: HashSet<String> = m.sessions.iter().map(|s| s.session_id.clone()).collect();
+        let mut gone: HashSet<String> = m
+            .views
+            .keys()
+            .filter(|id| !current.contains(*id))
+            .cloned()
+            .collect();
+        for id in prev_sessions {
+            if !current.contains(&id) {
+                gone.insert(id);
+            }
+        }
+        for id in gone {
+            m.background_views.remove(&id);
+            let blocks: Vec<String> = m
+                .views
+                .remove(&id)
+                .map(|view| view_blocks(&view).collect())
+                .unwrap_or_default();
+            for block in &blocks {
+                m.forget_block(block);
+            }
+            removed.push((id, blocks));
+        }
+        if m.selected.as_ref().is_some_and(|id| !current.contains(id)) {
             m.selected = None;
         }
     });
+    for (id, blocks) in removed {
+        sweep.cancel_session(&id);
+        state.forget_session(&id, blocks);
+    }
     Ok(())
 }
 
@@ -1158,64 +1230,62 @@ fn reconcile(
     if model.visible
         && let (Some(session_id), Some(window)) = (&model.selected, model.window())
     {
-        for block in window.layers.iter().flat_map(|l| &l.blocks) {
-            let Some(id) = &block.block_id else {
-                continue;
-            };
-            if block.creator_name.as_deref() != Some("com.superlogical.terminal") {
-                continue;
-            }
-            if window
-                .zoomed_block_id
-                .as_ref()
-                .is_some_and(|zoom| zoom != id)
-            {
-                continue;
-            }
-            visible.insert(id.clone());
-            if workers.contains_key(id) {
-                continue;
-            }
-            let state = Arc::new(Mutex::new(Model {
-                status: "Restoring terminal…".into(),
-                session: session_id.clone(),
-                block: id.clone(),
-                owner: block.owner.as_deref() == Some(&model.client_id),
-                control_connected: model.connected,
-                ..Default::default()
-            }));
-            let (wake, receiver) = flume::bounded(1);
-            let connection = Connection {
-                model: state.clone(),
-                commands: TerminalSender::new(sender.clone(), session_id.clone(), id.clone()),
-                wake: receiver,
-            };
-            shared.update(|m| {
-                m.terminals.insert(id.clone(), connection);
-            });
-            let pane = PaneShared {
-                model: state,
-                wake,
-                host_wake: shared.wake.clone(),
-            };
-            let (commands, data_commands) = flume::unbounded();
-            let task = tokio::task::spawn_local(run_data(
-                endpoint.to_owned(),
-                session_id.clone(),
-                id.clone(),
-                sender.clone(),
-                data_commands,
-                pane,
-            ));
-            workers.insert(
-                id.clone(),
-                PaneWorker {
+        for layer in &window.layers {
+            for block in &layer.blocks {
+                let Some(id) = &block.block_id else {
+                    continue;
+                };
+                if block.creator_name.as_deref() != Some("com.superlogical.terminal") {
+                    continue;
+                }
+                if !crate::layout::block_visible(window, layer, id) {
+                    continue;
+                }
+                visible.insert(id.clone());
+                if workers.contains_key(id) {
+                    continue;
+                }
+                let state = Arc::new(Mutex::new(Model {
+                    status: "Restoring terminal…".into(),
                     session: session_id.clone(),
-                    commands,
-                    task,
-                    size: None,
-                },
-            );
+                    block: id.clone(),
+                    owner: block.owner.as_deref() == Some(&model.client_id),
+                    control_connected: model.connected,
+                    ..Default::default()
+                }));
+                let (wake, receiver) = flume::bounded(1);
+                let connection = Connection {
+                    model: state.clone(),
+                    commands: TerminalSender::new(sender.clone(), session_id.clone(), id.clone()),
+                    wake: receiver,
+                };
+                shared.update(|m| {
+                    m.terminals.insert(id.clone(), connection);
+                });
+                let pane = PaneShared {
+                    model: state,
+                    wake,
+                    host_wake: shared.wake.clone(),
+                };
+                let (commands, data_commands) = flume::unbounded();
+                let task = tokio::task::spawn_local(run_data(
+                    endpoint.to_owned(),
+                    session_id.clone(),
+                    id.clone(),
+                    sender.clone(),
+                    data_commands,
+                    pane,
+                ));
+                workers.insert(
+                    id.clone(),
+                    PaneWorker {
+                        session: session_id.clone(),
+                        commands,
+                        task,
+                        size: None,
+                    },
+                );
+            }
         }
     }
     for (id, worker) in workers {
@@ -1334,7 +1404,13 @@ async fn declare_themes(
     }
 }
 
-fn remove_session(shared: &Shared, workers: &mut HashMap<String, PaneWorker>, id: &str) {
+fn remove_session(
+    shared: &Shared,
+    workers: &mut HashMap<String, PaneWorker>,
+    state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
+    id: &str,
+) {
     let blocks: Vec<_> = workers
         .iter()
         .filter(|(_, w)| w.session == id)
@@ -1343,20 +1419,26 @@ fn remove_session(shared: &Shared, workers: &mut HashMap<String, PaneWorker>, id
     for block in &blocks {
         workers.remove(block);
     }
+    let mut forgotten = blocks.clone();
     shared.update(|m| {
         m.sessions.retain(|s| s.session_id != id);
+        m.background_views.remove(id);
         if let Some(view) = m.views.remove(id) {
             for block in view_blocks(&view) {
                 m.forget_block(&block);
+                forgotten.push(block);
             }
         }
-        for block in blocks {
-            m.terminals.remove(&block);
+        for block in &blocks {
+            m.terminals.remove(block);
+            m.forget_block(block);
         }
         if m.selected.as_deref() == Some(id) {
             m.selected = None;
         }
     });
+    sweep.cancel_session(id);
+    state.forget_session(id, forgotten);
 }
 
 fn apply_bootstrap(
@@ -1388,20 +1470,30 @@ fn apply_bootstrap(
     state.add_tickets(boot.data_tickets, started);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: rexrs::Event,
     control: &mut Client,
     shared: &Shared,
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     keymap: Option<&keymap::Declaration>,
+    server_reads: &mut server_info::Reader,
+    hosts_reads: &mut hosts::Reader,
 ) -> Result<()> {
-    // This is a directed request, not a session update: even an unattached session or a
-    // sequence below bootstrap's cutoff needs an answer on this same connection.
+    // Directed requests, not session updates: even an unattached session or a sequence below
+    // bootstrap's cutoff needs an answer on this same connection.
     if event.name == "client_perform_requested" {
         return perform::receive(control, shared, event.payload, state.performs_since).await;
     }
-    // Config-wide events have no session sequence. Do not broaden includes().
+    if event.name == "client_prompt_requested" {
+        return prompt::receive(control, event.payload).await;
+    }
+    if event.name == "client_prompt_ended" {
+        return Ok(());
+    }
+    // Config-wide and server-wide events have no session sequence. Do not broaden includes().
     if event.name == "keymap_changed" {
         let refresh = {
             let m = shared.model.lock().expect("host model");
@@ -1413,21 +1505,168 @@ async fn handle_event(
         return Ok(());
     }
     if event.name == "hosts_changed" {
+        let reread = hosts::changed(
+            &shared.model.lock().expect("host model").shared,
+            hosts_reads.in_flight_hash(),
+            &event.payload,
+        );
+        if reread {
+            hosts_reads
+                .reread_for(control, event.payload["hash"].as_str())
+                .await?;
+        }
         return Ok(());
+    }
+    if event.name == "tailscale_status_changed" {
+        server_reads.reread_status(control).await?;
+        return Ok(());
+    }
+    if event.name == "event_dropped" && event.payload["session_id"].as_str().is_none() {
+        match event.payload["event_type"].as_str() {
+            Some("keymap_changed") => {
+                let connected = shared.model.lock().expect("host model").connected;
+                if connected && let Some(declaration) = keymap {
+                    keymap::refresh(control, shared, declaration).await;
+                }
+                return Ok(());
+            }
+            Some("hosts_changed") => {
+                let supported = !matches!(
+                    shared.model.lock().expect("host model").shared,
+                    hosts::SharedHostState::Unsupported
+                );
+                if supported {
+                    hosts_reads.reread_for(control, None).await?;
+                }
+                return Ok(());
+            }
+            Some("tailscale_status_changed") => {
+                server_reads.reread_status(control).await?;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
     if !state.includes(&event) {
         return Ok(());
     }
     match event.name.as_str() {
+        "event_dropped" => {
+            let event_type = event.payload["event_type"].as_str().unwrap_or("");
+            let session_id = event
+                .session_id
+                .as_deref()
+                .or_else(|| event.payload["session_id"].as_str());
+            match event_type {
+                "session_destroyed" => {
+                    if let Some(id) = session_id {
+                        remove_session(shared, workers, state, sweep, id);
+                    } else {
+                        list(control, shared, state, sweep).await?;
+                    }
+                }
+                "session_created" | "session_moved" | "session_label_changed" => {
+                    list(control, shared, state, sweep).await?;
+                    if event_type == "session_label_changed" {
+                        shared.update(|m| {
+                            for session in &m.sessions {
+                                if let Some(view) = m.views.get_mut(&session.session_id) {
+                                    view.label = Some(session.label.clone());
+                                }
+                            }
+                        });
+                    }
+                }
+                _ if let Some(id) = session_id => {
+                    let dropped_block = event.payload["block_id"].as_str().map(str::to_owned);
+                    // Cancel any in-flight background status reads for this session before
+                    // awaiting `refresh` so late replies cannot race with recovery.
+                    sweep.cancel_session(id);
+                    let (should_refresh, mut forget) = {
+                        let m = shared.model.lock().expect("host model");
+                        let has_view = m.views.contains_key(id);
+                        let blocks: Vec<String> = m
+                            .views
+                            .get(id)
+                            .map(|v| view_blocks(v).collect())
+                            .unwrap_or_default();
+                        (has_view || m.selected.as_deref() == Some(id), blocks)
+                    };
+                    if let Some(block) = dropped_block {
+                        forget.push(block);
+                    }
+                    if should_refresh {
+                        match refresh(control, shared, state, id).await {
+                            Ok(()) => {
+                                let new_blocks: Vec<String> = shared
+                                    .model
+                                    .lock()
+                                    .expect("host model")
+                                    .views
+                                    .get(id)
+                                    .map(|v| view_blocks(v).collect())
+                                    .unwrap_or_default();
+                                forget.extend(new_blocks);
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.downcast_ref::<rexrs::Error>(),
+                                    Some(rexrs::Error::Api(
+                                        rexrs::ApiError::SessionNotFound { .. }
+                                    ))
+                                ) =>
+                            {
+                                remove_session(shared, workers, state, sweep, id);
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        state.viewed.remove(id);
+                        if state.view_reading.as_deref() == Some(id) {
+                            state.view_stale = true;
+                        }
+                        if state.fetch_reading.contains(id) {
+                            state.fetch_stale.insert(id.to_owned());
+                        }
+                    }
+                    shared.update(|m| {
+                        for block in &forget {
+                            m.status_read.remove(block);
+                            // Downgrade live records so a dropped StatusRemoved is not kept
+                            // stuck by status_sweep::merge's live-record preservation rule.
+                            if let Some(records) = m.activity.get_mut(block) {
+                                for record in records.values_mut() {
+                                    record.live = false;
+                                }
+                            }
+                        }
+                    });
+                    for block in &forget {
+                        state.queried.remove(block);
+                        state.status_queried.remove(block);
+                        state.status_failed.remove(block);
+                        state.status_reading.remove(block);
+                        sweep.cancel_block(block);
+                    }
+                }
+                _ if event_type.starts_with("session_") => {
+                    list(control, shared, state, sweep).await?;
+                }
+                _ => {
+                    log::debug!("ignoring unhandled server-wide event_dropped: {event_type:?}");
+                }
+            }
+        }
         "session_created" | "session_moved" => {
-            list(control, shared, state).await?;
+            list(control, shared, state, sweep).await?;
         }
         "session_destroyed" => {
             if let Some(id) = event.payload["session_id"]
                 .as_str()
                 .or(event.session_id.as_deref())
             {
-                remove_session(shared, workers, id);
+                remove_session(shared, workers, state, sweep, id);
             }
         }
         "session_label_changed" => {
@@ -1472,6 +1711,8 @@ async fn handle_event(
                 if let Some(worker) = workers.remove(block) {
                     let _ = worker.commands.send(DataCommand::Stop);
                 }
+                sweep.cancel_block(block);
+                state.forget_block(block);
                 shared.update(|m| {
                     m.terminals.remove(block);
                     m.forget_block(block);
@@ -1659,6 +1900,7 @@ async fn run_host(
                 m.activity_incomplete = false;
             });
             let mut state = ControlState::default();
+            let mut sweep = status_sweep::Reader::default();
             let mut downloads = downloads::Downloads::default();
             let mut busy_since = Some(Instant::now());
             let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
@@ -1685,7 +1927,7 @@ async fn run_host(
                 let layout = crate::layout::shell_layout(shell.as_deref(), new_block_theme(shared, theme.as_ref()));
                 let created = request(&mut control, "session.create", json!({"label":label,"initial_windows":[{"layout":layout}]})).await?;
                 preferred = created["session_id"].as_str().map(str::to_owned);
-                list(&mut control, shared, &mut state).await?;
+                list(&mut control, shared, &mut state, &mut sweep).await?;
             }
             let selected = {
                 let model = shared.model.lock().expect("host model");
@@ -1701,7 +1943,7 @@ async fn run_host(
             });
             let session_ids: HashSet<_> = shared.model.lock().expect("host model").sessions.iter().map(|s| s.session_id.clone()).collect();
             let stale: HashSet<_> = workers.values().filter(|w| !session_ids.contains(&w.session)).map(|w| w.session.clone()).collect();
-            for id in stale { remove_session(shared, &mut workers, &id); }
+            for id in stale { remove_session(shared, &mut workers, &mut state, &mut sweep, &id); }
             let mut attached: HashSet<String> = workers.values().map(|w| w.session.clone()).collect();
             if let Some(id) = &selected { attached.insert(id.clone()); }
             for id in attached {
@@ -1712,8 +1954,23 @@ async fn run_host(
                 refresh(&mut control, shared, &mut state, id).await?;
             }
             state.performs_since = busy_since;
+            server_reads.reset();
+            hosts_reads.reset();
             let queued: Vec<_> = control.drain_events().collect();
-            for event in queued { handle_event(event, &mut control, shared, &mut workers, &mut state, keymap.as_deref()).await?; }
+            for event in queued {
+                handle_event(
+                    event,
+                    &mut control,
+                    shared,
+                    &mut workers,
+                    &mut state,
+                    &mut sweep,
+                    keymap.as_deref(),
+                    &mut server_reads,
+                    &mut hosts_reads,
+                )
+                .await?;
+            }
             state.prune(&shared.model.lock().expect("host model"));
             shared.update(|m| m.ssh_problem = None);
             shared.status("Connected", true);
@@ -1726,16 +1983,13 @@ async fn run_host(
             query_activity(&mut control, shared, &mut state).await;
             // Restore terminal sizes and state before a best-effort keymap can wait.
             if let Some(declaration) = &keymap { keymap::refresh(&mut control, shared, declaration).await; }
-            server_reads.reset();
             server_reads.start(&mut control).await?;
-            hosts_reads.reset();
             hosts_reads.start(&mut control).await?;
             // The last connection's listing can no longer be answered.
             directory_reads.abandon(shared, directory::Failure::Disconnected);
             retry = 0;
             prefetch.reset();
             view_fetches.reset();
-            let mut sweep = status_sweep::Reader::default();
             let mut pace = tokio::time::interval(prefetch::PACE);
             pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut expiry = tokio::time::interval(Duration::from_millis(100));
@@ -1747,19 +2001,18 @@ async fn run_host(
                     use futures_util::FutureExt;
                     if let Some(event) = control.next_event().now_or_never() {
                         let event = event?;
-                        if event.name == "tailscale_status_changed" { server_reads.reread_status(&mut control).await?; }
-                        if event.name == "hosts_changed"
-                            && hosts::changed(
-                                &shared.model.lock().expect("host model").shared,
-                                hosts_reads.in_flight_hash(),
-                                &event.payload,
-                            )
-                        {
-                            hosts_reads
-                                .reread_for(&mut control, event.payload["hash"].as_str())
-                                .await?;
-                        }
-                        handle_event(event, &mut control, shared, &mut workers, &mut state, keymap.as_deref()).await?;
+                        handle_event(
+                            event,
+                            &mut control,
+                            shared,
+                            &mut workers,
+                            &mut state,
+                            &mut sweep,
+                            keymap.as_deref(),
+                            &mut server_reads,
+                            &mut hosts_reads,
+                        )
+                        .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
                         declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
@@ -1903,19 +2156,18 @@ async fn run_host(
                     event = control.next_event() => {
                         busy_since = Some(Instant::now());
                         let event = event?;
-                        if event.name == "tailscale_status_changed" { server_reads.reread_status(&mut control).await?; }
-                        if event.name == "hosts_changed"
-                            && hosts::changed(
-                                &shared.model.lock().expect("host model").shared,
-                                hosts_reads.in_flight_hash(),
-                                &event.payload,
-                            )
-                        {
-                            hosts_reads
-                                .reread_for(&mut control, event.payload["hash"].as_str())
-                                .await?;
-                        }
-                        handle_event(event, &mut control, shared, &mut workers, &mut state, keymap.as_deref()).await?;
+                        handle_event(
+                            event,
+                            &mut control,
+                            shared,
+                            &mut workers,
+                            &mut state,
+                            &mut sweep,
+                            keymap.as_deref(),
+                            &mut server_reads,
+                            &mut hosts_reads,
+                        )
+                        .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
                         declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
@@ -2005,6 +2257,7 @@ async fn run_host(
                                     shared,
                                     &mut workers,
                                     &mut state,
+                                    &mut sweep,
                                     Some(&session),
                                 )
                                 .await
@@ -2110,7 +2363,7 @@ async fn run_host(
                         }
                         if matches!(command, HostCommand::Select(_) | HostCommand::Navigate { .. } | HostCommand::CreateSession { .. }) { preferred = None; }
                         let navigation = match &command { HostCommand::Navigate { id, .. } => Some(*id), _ => None };
-                        let outcome = handle_command(command, &mut control, shared, &mut workers, &mut state, &mut theme).await;
+                        let outcome = handle_command(command, &mut control, shared, &mut workers, &mut state, &mut sweep, &mut theme).await;
                         if let Some(id) = navigation {
                             shared.update(|m| m.navigation_result = Some((id, outcome.is_ok())));
                         }
@@ -2373,6 +2626,7 @@ async fn after_request(
     shared: &Shared,
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     session: Option<&str>,
 ) -> Result<()> {
     shared.update(|m| m.notice = None);
@@ -2385,7 +2639,7 @@ async fn after_request(
                     Some(rexrs::Error::Api(rexrs::ApiError::SessionNotFound { .. }))
                 ) =>
             {
-                remove_session(shared, workers, id)
+                remove_session(shared, workers, state, sweep, id)
             }
             result => result?,
         }
@@ -2399,6 +2653,7 @@ async fn handle_command(
     shared: &Shared,
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
+    sweep: &mut status_sweep::Reader,
     theme: &mut Option<SetTheme>,
 ) -> Result<()> {
     match command {
@@ -2470,10 +2725,10 @@ async fn handle_command(
             });
         }
         HostCommand::RefreshSessions => {
-            list(control, shared, state).await?;
+            list(control, shared, state, sweep).await?;
             // A selected session that has gone is forgotten by the list, not re-read.
             let selected = shared.model.lock().expect("host model").selected.clone();
-            after_request(control, shared, workers, state, selected.as_deref()).await?;
+            after_request(control, shared, workers, state, sweep, selected.as_deref()).await?;
         }
         HostCommand::CreateSession { label, shell } => {
             let layout = crate::layout::shell_layout(
@@ -2487,7 +2742,7 @@ async fn handle_command(
             }
             let created = request(control, "session.create", payload).await?;
             let id = created["session_id"].as_str().context("new session ID")?;
-            list(control, shared, state).await?;
+            list(control, shared, state, sweep).await?;
             attach(control, shared, state, id).await?;
             shared.update(|m| {
                 m.background_views.remove(id);
@@ -2498,7 +2753,15 @@ async fn handle_command(
         HostCommand::Request { method, payload } => {
             let session_id = payload["session_id"].as_str().map(str::to_owned);
             request(control, &method, payload).await?;
-            after_request(control, shared, workers, state, session_id.as_deref()).await?;
+            after_request(
+                control,
+                shared,
+                workers,
+                state,
+                sweep,
+                session_id.as_deref(),
+            )
+            .await?;
         }
         HostCommand::NewTerminal {
             method,
@@ -2514,7 +2777,7 @@ async fn handle_command(
             }
             // Creation is sent once. A failure follows the ordinary request path; never replay.
             request(control, &method, payload).await?;
-            after_request(control, shared, workers, state, Some(&session)).await?;
+            after_request(control, shared, workers, state, sweep, Some(&session)).await?;
         }
         HostCommand::Ticket {
             session,
