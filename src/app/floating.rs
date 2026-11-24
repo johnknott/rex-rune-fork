@@ -306,29 +306,43 @@ impl Workspace {
         }
         match action {
             // The menu's own tab, session and folder, never the ones on screen now.
-            LayerAction::NewFloating => self.new_floating_layer(
-                self.layer_host(&target).expect("validated host"),
-                &target.session,
-                &target.window,
-                Some(&target.block),
-            ),
+            LayerAction::NewFloating => {
+                self.exit_copy_mode();
+                self.new_floating_layer(
+                    self.layer_host(&target).expect("validated host"),
+                    &target.session,
+                    &target.window,
+                    Some(&target.block),
+                )
+            }
             LayerAction::Float => self.layer_request(
                 &target,
                 "session.float_block",
                 json!({"block_id":target.block,"bounds":layers::REQUESTED_BOUNDS}),
             ),
             // The server keeps the block and its program; only the state changes.
-            LayerAction::Minimize => self.layer_request(
-                &target,
-                "session.set_layer_state",
-                json!({"layer_id":target.layer,"state":"minimized"}),
-            ),
+            LayerAction::Minimize => {
+                if self.copy_mode.as_ref().is_some_and(|session| {
+                    session.key.0 == target.host_id
+                        && target.panes.iter().any(|(id, _)| id == &session.key.1)
+                }) {
+                    self.exit_copy_mode();
+                }
+                self.layer_request(
+                    &target,
+                    "session.set_layer_state",
+                    json!({"layer_id":target.layer,"state":"minimized"}),
+                )
+            }
             // One call restores or focuses and raises, in one revision: no second request.
-            LayerAction::Focus => self.layer_request(
-                &target,
-                "session.set_layer_state",
-                json!({"layer_id":target.layer,"state":"normal","focus":true}),
-            ),
+            LayerAction::Focus => {
+                self.exit_copy_mode();
+                self.layer_request(
+                    &target,
+                    "session.set_layer_state",
+                    json!({"layer_id":target.layer,"state":"normal","focus":true}),
+                )
+            }
             // Bring to front never focuses, so it is named for raising alone.
             LayerAction::Raise => self.layer_request(
                 &target,
