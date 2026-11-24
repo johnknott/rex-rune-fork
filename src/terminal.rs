@@ -12,9 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod copy_mode;
 pub mod graphics;
 pub mod search;
 pub mod selection;
+
+pub use copy_mode::{CopyModeInput, CopyModeOp, CopyMotion, CopyUnit, CopyView, CopyYank};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Part {
@@ -296,6 +299,8 @@ pub struct Frame {
     pub wrapped: Vec<bool>,
     /// The user's search of this terminal, while there is one.
     pub search: Option<search::Results>,
+    /// Local VT copy-mode cursor and selection state, while copy mode is active.
+    pub copy: Option<copy_mode::CopyView>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -351,12 +356,15 @@ impl Frame {
         Some((row * cols + start, row * cols + end))
     }
     /// An explicit prompt jump keeps the viewport top visible in a smaller pane. Otherwise
-    /// cropping retains the newest rows, the program cursor, or a selected search match.
-    /// Search navigation clears the prompt anchor; an old match must not hide a new prompt.
-    /// This never changes the server size.
+    /// cropping retains the newest rows, the program cursor, the copy-mode crop origin, or a
+    /// selected search match. Search navigation clears the prompt anchor; an old match must
+    /// not hide a new prompt. This never changes the server size.
     pub fn display_row_start(&self, visible_rows: usize) -> usize {
         let visible = visible_rows.max(1);
         let bottom = (self.rows as usize).saturating_sub(visible);
+        if let Some(copy) = self.copy {
+            return usize::from(copy.display_start).min(bottom);
+        }
         if self.prompt_anchor {
             return 0;
         }
@@ -474,6 +482,7 @@ impl Renderer {
             ],
             wrapped: Vec::new(),
             search: None,
+            copy: None,
         };
         let mut uri = Vec::new();
         let mut rows = self.rows.update(&snapshot)?;
@@ -609,6 +618,26 @@ mod tests {
         assert!(hidden_cursor.cursor.is_none());
         assert_eq!(hidden_cursor.cursor_at, Some((0, 1)));
         assert_eq!(hidden_cursor.display_row_start(3), 2);
+
+        // Copy-mode display_start is the single source of truth on cropped panes, clamped
+        // cleanly to rows - visible without separate UI crop tracking.
+        let mut with_copy = hidden_cursor;
+        with_copy.copy = Some(CopyView {
+            epoch: 1,
+            cursor: (0, 0),
+            wide: false,
+            unit: None,
+            display_start: 0,
+        });
+        assert_eq!(with_copy.display_row_start(3), 0);
+        with_copy.copy.as_mut().unwrap().display_start = 1;
+        assert_eq!(with_copy.display_row_start(3), 1);
+        with_copy.copy.as_mut().unwrap().display_start = 99;
+        assert_eq!(
+            with_copy.display_row_start(3),
+            2,
+            "clamped to rows - visible"
+        );
     }
 
     #[test]
