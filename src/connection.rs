@@ -556,6 +556,13 @@ pub enum HostCommand {
     DownloadConfirm(u64),
     /// Stop a download at any point; its partial file is deleted.
     DownloadCancel(u64),
+    /// Update `SSH_AUTH_SOCK` for future SSH runs on this host without dropping live
+    /// connections. When `wake_auth_retry` is true and this is a disconnected `ssh://` host
+    /// whose last error was `Problem::AuthFailed`, cut short backoff and retry immediately.
+    SshAgent {
+        socket: Option<PathBuf>,
+        wake_auth_retry: bool,
+    },
     Reconnect,
     /// The terminal theme to declare from now on, also while disconnected; none declares
     /// nothing (Follow server).
@@ -878,6 +885,41 @@ impl HostConnection {
         theme: Option<SetTheme>,
         label: String,
     ) -> Self {
+        Self::spawn_with_ssh_agent(
+            endpoint, preferred, create, block, visible, theme, label, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_ssh_agent(
+        endpoint: String,
+        preferred: Option<String>,
+        create: Option<(String, Option<String>)>,
+        block: Option<String>,
+        visible: bool,
+        theme: Option<SetTheme>,
+        label: String,
+        ssh_auth_sock: Option<PathBuf>,
+    ) -> Self {
+        Self::spawn_internal(
+            endpoint,
+            Startup {
+                preferred,
+                create,
+                block,
+                theme,
+                label,
+                ssh_auth_sock,
+                #[cfg(test)]
+                ssh_program: None,
+                #[cfg(test)]
+                tunnel_dir: None,
+            },
+            visible,
+        )
+    }
+
+    fn spawn_internal(endpoint: String, startup: Startup, visible: bool) -> Self {
         let model = Arc::new(Mutex::new(HostModel {
             visible,
             status: "Connecting…".into(),
@@ -890,13 +932,6 @@ impl HostConnection {
             wake,
         };
         let sender = commands.clone();
-        let startup = Startup {
-            preferred,
-            create,
-            block,
-            theme,
-            label,
-        };
         let alive = HostThread(Arc::as_ptr(&model) as usize);
         running_hosts().push(alive.0);
         std::thread::Builder::new()
@@ -1450,6 +1485,11 @@ struct Startup {
     create: Option<(String, Option<String>)>,
     block: Option<String>,
     theme: Option<SetTheme>,
+    ssh_auth_sock: Option<PathBuf>,
+    #[cfg(test)]
+    ssh_program: Option<PathBuf>,
+    #[cfg(test)]
+    tunnel_dir: Option<PathBuf>,
 }
 
 async fn run_host(
@@ -1465,6 +1505,11 @@ async fn run_host(
         block: mut initial_block,
         mut theme,
         label,
+        mut ssh_auth_sock,
+        #[cfg(test)]
+        ssh_program,
+        #[cfg(test)]
+        tunnel_dir,
     } = startup;
     let mut token: Option<String> = None;
     let mut workers = HashMap::<String, PaneWorker>::new();
@@ -1482,7 +1527,26 @@ async fn run_host(
             let endpoint = match &ssh {
                 Some(target) => {
                     shared.status("Connecting over SSH…", false);
-                    let opened = crate::ssh::Tunnel::open(target).await?;
+                    let opened = {
+                        #[cfg(test)]
+                        if ssh_program.is_some() || tunnel_dir.is_some() {
+                            crate::ssh::Tunnel::open_with(
+                                target,
+                                ssh_program
+                                    .as_deref()
+                                    .map_or(std::ffi::OsStr::new("ssh"), std::path::Path::as_os_str),
+                                ssh_auth_sock.as_deref(),
+                                tunnel_dir.as_deref(),
+                            )
+                            .await?
+                        } else {
+                            crate::ssh::Tunnel::open(target, ssh_auth_sock.as_deref()).await?
+                        }
+                        #[cfg(not(test))]
+                        {
+                            crate::ssh::Tunnel::open(target, ssh_auth_sock.as_deref()).await?
+                        }
+                    };
                     let local = opened.endpoint().to_owned();
                     tunnel = Some(opened);
                     local
@@ -1705,6 +1769,10 @@ async fn run_host(
                         let Ok(command) = command else { control.close().await?; return Ok(true); };
                         if matches!(command, HostCommand::Shutdown) { control.close().await?; return Ok(true); }
                         if matches!(command, HostCommand::Reconnect) { return Ok(false); }
+                        if let HostCommand::SshAgent { socket, .. } = command {
+                            ssh_auth_sock = socket;
+                            continue;
+                        }
                         if let HostCommand::StopServer { epoch } = command {
                             if epoch != shared.model.lock().expect("host model").connection_epoch {
                                 shared.update(|m| m.notice = Some("Stop not sent: the connection changed. Review Stop server again.".into()));
@@ -1878,6 +1946,19 @@ async fn run_host(
                 command = commands.recv_async() => match command {
                     Ok(HostCommand::Shutdown) | Err(_) => return Ok(()),
                     Ok(HostCommand::Reconnect) => break,
+                    Ok(HostCommand::SshAgent { socket, wake_auth_retry }) => {
+                        ssh_auth_sock = socket;
+                        let auth_failed = shared
+                            .model
+                            .lock()
+                            .expect("host model")
+                            .ssh_problem
+                            == Some(crate::ssh::Problem::AuthFailed);
+                        if wake_auth_retry && ssh.is_some() && auth_failed {
+                            retry = 0;
+                            break;
+                        }
+                    }
                     Ok(HostCommand::Select(id)) => preferred = Some(id),
                     Ok(HostCommand::Navigate { id, .. }) => reject_navigation(shared, id),
                     Ok(HostCommand::Visibility(visible)) => shared.update(|m|m.visible=visible),
@@ -1913,6 +1994,7 @@ async fn run_host(
                 HostCommand::Visibility(visible) => shared.update(|m| m.visible = visible),
                 HostCommand::PrefetchViews(sessions) => prefetch.set_eligible(sessions),
                 HostCommand::Theme(new) => theme = new,
+                HostCommand::SshAgent { socket, .. } => ssh_auth_sock = socket,
                 HostCommand::Keymap(new) => keymap = Some(new),
                 HostCommand::Identify => server_reads.want(),
                 HostCommand::Ticket { reply, .. } => {
@@ -2363,6 +2445,7 @@ async fn handle_command(
         }
         HostCommand::ListDir(_)
         | HostCommand::Reconnect
+        | HostCommand::SshAgent { .. }
         | HostCommand::Shutdown
         | HostCommand::StopServer { .. }
         | HostCommand::ResizeLayer { .. }
