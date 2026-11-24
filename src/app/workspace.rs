@@ -85,6 +85,8 @@ pub struct Workspace {
     pub last_keypress: Option<std::time::Instant>,
     pub remote_off_notices: HashSet<HostId>,
     pub remote_navigation: Option<super::remote::Navigation>,
+    pub remote_mutes: Vec<super::remote::PendingMute>,
+    pub next_fetch_id: u64,
     /// Panes this window has taken size ownership of since it last came forward.
     pub claimed: HashSet<(HostId, String)>,
     pub handle: AppHandle<Workspace>,
@@ -295,6 +297,8 @@ impl Workspace {
             last_keypress: None,
             remote_off_notices: HashSet::new(),
             remote_navigation: None,
+            remote_mutes: Vec::new(),
+            next_fetch_id: 0,
             claimed: HashSet::new(),
             handle,
             window_focused: true,
@@ -590,7 +594,16 @@ impl Workspace {
         let activity_selection = self.activity_selection();
         let id = self.hosts[index].id;
         let old_session = self.hosts[index].model.selected.clone();
-        let (mut model, notices, clipboard, bells, client_actions, performs, shared_writes) = {
+        let (
+            mut model,
+            notices,
+            clipboard,
+            bells,
+            client_actions,
+            performs,
+            shared_writes,
+            view_fetches,
+        ) = {
             let mut shared = self.hosts[index]
                 .connection
                 .model
@@ -602,6 +615,7 @@ impl Workspace {
             let client_actions = std::mem::take(&mut shared.client_actions);
             let performs = std::mem::take(&mut shared.performs);
             let shared_writes = std::mem::take(&mut shared.shared_writes);
+            let view_fetches = std::mem::take(&mut shared.view_fetches);
             (
                 shared.clone(),
                 notices,
@@ -610,8 +624,10 @@ impl Workspace {
                 client_actions,
                 performs,
                 shared_writes,
+                view_fetches,
             )
         };
+        model.view_fetches = view_fetches;
         for (block, connection) in &model.terminals {
             let key = (id, block.clone());
             if !self.terminals.contains_key(&key) {
@@ -674,7 +690,9 @@ impl Workspace {
         }
         self.reconcile_copy_mode();
         self.announce_keymap_problems(index);
-        self.poll_remote_navigation(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.poll_remote_navigation(now);
+        self.poll_remote_mutes(now);
         for pending in performs {
             self.remote_perform(index, pending, tx);
         }

@@ -24,6 +24,9 @@ mod prefetch;
 pub mod server_info;
 mod status_sweep;
 pub mod titles;
+mod view_fetch;
+
+pub use view_fetch::ViewFetchOutcome;
 
 /// The label new tabs get. A tab that still has it shows its program's terminal title.
 pub const DEFAULT_TAB_LABEL: &str = "Shell";
@@ -274,6 +277,8 @@ pub struct HostModel {
     pub selected: Option<String>,
     /// Completion of the latest client navigation request (id, success), not a notice.
     pub navigation_result: Option<(u64, bool)>,
+    /// Completed on-demand read-only session view fetches, drained once by the UI.
+    pub view_fetches: Vec<(u64, ViewFetchOutcome)>,
     /// Most recent read-only directory reply; only its browser/request may consume it.
     pub directory: Option<Arc<directory::Reply>>,
     pub views: HashMap<String, session::ViewResponse>,
@@ -541,6 +546,14 @@ pub enum HostCommand {
     /// The sessions whose views to load in the background, for listing their tabs; empty
     /// stops loading.
     PrefetchViews(HashSet<String>),
+    /// Read-only `session.view` fetch for a listed unloaded session, without attaching or
+    /// selecting it.
+    FetchView {
+        id: u64,
+        epoch: u64,
+        deadline: Instant,
+        session: String,
+    },
     /// A new session: the server picks a unique label when `label` is none; `shell` starts
     /// its first terminal.
     CreateSession {
@@ -641,6 +654,9 @@ struct ControlState {
     /// meanwhile: that change was ignored for want of a layout, so it is read once more.
     view_reading: Option<String>,
     view_stale: bool,
+    /// Sessions with an in-flight on-demand `FetchView` whose layout changed meanwhile.
+    fetch_reading: HashSet<String>,
+    fetch_stale: HashSet<String>,
     /// The theme last declared to each block on this connection.
     themed: HashMap<String, SetTheme>,
     // This pool is scoped to the terminal data ref and subprotocol; other sources
@@ -1028,31 +1044,46 @@ async fn attach(
     Ok(())
 }
 fn apply_view(shared: &Shared, id: &str, view: session::ViewResponse) {
-    shared.update(|m| {
-        if m.views
-            .get(id)
-            .is_some_and(|old| old.revision > view.revision)
-        {
-            return;
+    shared.update(|m| apply_view_to_model(m, id, view));
+}
+
+fn apply_view_to_model(m: &mut HostModel, id: &str, view: session::ViewResponse) {
+    if m.views
+        .get(id)
+        .is_some_and(|old| old.revision > view.revision)
+    {
+        return;
+    }
+    if let Some(label) = &view.label
+        && let Some(s) = m.sessions.iter_mut().find(|s| s.session_id == id)
+    {
+        s.label = label.clone();
+    }
+    for block in view
+        .windows
+        .iter()
+        .flat_map(|w| &w.layers)
+        .flat_map(|l| &l.blocks)
+    {
+        if let Some(connection) = block.block_id.as_ref().and_then(|id| m.terminals.get(id)) {
+            connection.model.lock().expect("terminal model").owner =
+                block.owner.as_deref() == Some(&m.client_id);
         }
-        if let Some(label) = &view.label
-            && let Some(s) = m.sessions.iter_mut().find(|s| s.session_id == id)
-        {
-            s.label = label.clone();
-        }
-        for block in view
-            .windows
-            .iter()
-            .flat_map(|w| &w.layers)
-            .flat_map(|l| &l.blocks)
-        {
-            if let Some(connection) = block.block_id.as_ref().and_then(|id| m.terminals.get(id)) {
-                connection.model.lock().expect("terminal model").owner =
-                    block.owner.as_deref() == Some(&m.client_id);
-            }
-        }
-        m.views.insert(id.into(), view);
-    });
+    }
+    m.views.insert(id.into(), view);
+}
+
+const VIEW_FETCH_CAP: usize = 64;
+
+fn record_view_fetches(
+    m: &mut HostModel,
+    entries: impl IntoIterator<Item = (u64, ViewFetchOutcome)>,
+) {
+    m.view_fetches.extend(entries);
+    if m.view_fetches.len() > VIEW_FETCH_CAP {
+        let extra = m.view_fetches.len() - VIEW_FETCH_CAP;
+        m.view_fetches.drain(..extra);
+    }
 }
 async fn refresh(
     control: &mut Client,
@@ -1425,9 +1456,14 @@ async fn handle_event(
                         .is_some_and(|new| new > revision)
                 }) {
                     refresh(control, shared, state, id).await?;
-                } else if revision.is_none() && state.view_reading.as_deref() == Some(id) {
+                } else if revision.is_none() {
                     // The reply on its way may predate this change.
-                    state.view_stale = true;
+                    if state.view_reading.as_deref() == Some(id) {
+                        state.view_stale = true;
+                    }
+                    if state.fetch_reading.contains(id) {
+                        state.fetch_stale.insert(id.to_owned());
+                    }
                 }
             }
         }
@@ -1554,6 +1590,7 @@ async fn run_host(
     let mut server_reads = server_info::Reader::default();
     let mut hosts_reads = hosts::Reader::default();
     let mut directory_reads = directory::Reader::default();
+    let mut view_fetches = view_fetch::Reader::default();
     // An ssh:// host is reached through a forward of its Rex socket; every attempt opens a
     // fresh one, and its end is a disconnect like any other.
     let ssh = crate::ssh::Target::parse(&configured)?;
@@ -1596,6 +1633,7 @@ async fn run_host(
             shared.update(|m| {
                 m.connection_epoch += 1;
                 m.performs.clear();
+                m.view_fetches.clear();
                 m.client_id = identity.id.clone();
                 m.protocol.api_revision = control.welcome().api_revision;
                 m.server_info = server_info::ServerInfo::welcomed(control.welcome());
@@ -1696,6 +1734,7 @@ async fn run_host(
             directory_reads.abandon(shared, directory::Failure::Disconnected);
             retry = 0;
             prefetch.reset();
+            view_fetches.reset();
             let mut sweep = status_sweep::Reader::default();
             let mut pace = tokio::time::interval(prefetch::PACE);
             pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1803,6 +1842,64 @@ async fn run_host(
                     reply = server_reads.finished(), if server_reads.in_flight() => server_info::record(shared, reply),
                     reply = hosts_reads.finished(), if hosts_reads.in_flight() => hosts::record(shared, reply),
                     _ = directory_reads.finished(shared), if directory_reads.in_flight() => {}
+                    fetched = view_fetches.finished(), if view_fetches.in_flight() => {
+                        match fetched {
+                            view_fetch::Event::Reply { session, ids, result: Ok((seq, view)) } => {
+                                if !view_fetches.reading(&session) {
+                                    state.fetch_reading.remove(&session);
+                                }
+                                let stale = state.fetch_stale.remove(&session);
+                                let mut placed = false;
+                                shared.update(|m| {
+                                    if !m.sessions.iter().any(|s| s.session_id == session) {
+                                        record_view_fetches(
+                                            m,
+                                            ids.iter().map(|&id| (id, ViewFetchOutcome::NotFound)),
+                                        );
+                                        return;
+                                    }
+                                    if !m.views.contains_key(&session) {
+                                        apply_view_to_model(m, &session, view);
+                                        if m.selected.as_deref() != Some(session.as_str()) {
+                                            m.background_views.insert(session.clone());
+                                        }
+                                        placed = true;
+                                    }
+                                    record_view_fetches(
+                                        m,
+                                        ids.iter().map(|&id| (id, ViewFetchOutcome::Loaded)),
+                                    );
+                                });
+                                if placed {
+                                    state.view_seq.insert(session.clone(), seq);
+                                    if stale {
+                                        let _ = refresh(&mut control, shared, &mut state, &session).await;
+                                    }
+                                }
+                            }
+                            view_fetch::Event::Reply { session, ids, result: Err(outcome) } => {
+                                if !view_fetches.reading(&session) {
+                                    state.fetch_reading.remove(&session);
+                                    state.fetch_stale.remove(&session);
+                                }
+                                shared.update(|m| {
+                                    record_view_fetches(m, ids.into_iter().map(|id| (id, outcome)));
+                                });
+                            }
+                            view_fetch::Event::Expired { session, ids, finished } => {
+                                if finished && !view_fetches.reading(&session) {
+                                    state.fetch_reading.remove(&session);
+                                    state.fetch_stale.remove(&session);
+                                }
+                                shared.update(|m| {
+                                    record_view_fetches(
+                                        m,
+                                        ids.into_iter().map(|id| (id, ViewFetchOutcome::Failed)),
+                                    );
+                                });
+                            }
+                        }
+                    }
                     event = control.next_event() => {
                         busy_since = Some(Instant::now());
                         let event = event?;
@@ -1931,6 +2028,37 @@ async fn run_host(
                             continue;
                         }
                         if let HostCommand::PrefetchViews(sessions) = command { prefetch.set_eligible(sessions); continue; }
+                        if let HostCommand::FetchView { id, epoch, deadline, session } = command {
+                            let (live_epoch, already_loaded, listed) = {
+                                let m = shared.model.lock().expect("host model");
+                                (
+                                    m.connection_epoch,
+                                    m.views.contains_key(&session),
+                                    m.sessions.iter().any(|s| s.session_id == session),
+                                )
+                            };
+                            if epoch != live_epoch {
+                                continue;
+                            }
+                            if already_loaded {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::Loaded)]));
+                                continue;
+                            }
+                            if !listed {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::NotFound)]));
+                                continue;
+                            }
+                            if Instant::now() >= deadline {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::Failed)]));
+                                continue;
+                            }
+                            if view_fetches.start(&mut control, id, deadline, session.clone()).await? {
+                                state.fetch_reading.insert(session);
+                            } else {
+                                shared.update(|m| record_view_fetches(m, [(id, ViewFetchOutcome::Failed)]));
+                            }
+                            continue;
+                        }
                         if let HostCommand::Identify = command {
                             server_reads.want();
                             server_reads.start(&mut control).await?;
@@ -2004,6 +2132,7 @@ async fn run_host(
         }
         shared.update(|m| {
             m.performs.clear();
+            m.view_fetches.clear();
             m.ssh_problem = result
                 .as_ref()
                 .err()
@@ -2063,7 +2192,11 @@ async fn run_host(
                         "Shared host removal not sent while disconnected. Try again after reconnecting.",
                     ),
                     Ok(HostCommand::Ticket { reply, .. }) => { let _ = reply.send(Err("Host is reconnecting".into())); }
-                    Ok(HostCommand::Claim { .. } | HostCommand::PerformReply { .. }) => {}
+                    Ok(
+                        HostCommand::Claim { .. }
+                        | HostCommand::PerformReply { .. }
+                        | HostCommand::FetchView { .. },
+                    ) => {}
                     Ok(HostCommand::ListDir(request)) => directory::finish(shared, &request, Err(directory::Failure::Disconnected)),
                     Ok(HostCommand::Download(request)) => downloads::refuse(shared, *request, crate::download::Failure::Disconnected),
                     Ok(HostCommand::DownloadConfirm(_) | HostCommand::DownloadCancel(_)) => {}
@@ -2567,6 +2700,7 @@ async fn handle_command(
         | HostCommand::StopServer { .. }
         | HostCommand::ResizeLayer { .. }
         | HostCommand::PrefetchViews(_)
+        | HostCommand::FetchView { .. }
         | HostCommand::Keymap(_)
         | HostCommand::Identify
         | HostCommand::WatchSharedHosts
