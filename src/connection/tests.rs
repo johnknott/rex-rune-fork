@@ -9,6 +9,8 @@ mod directory_tests;
 mod download_tests;
 #[path = "fetch_view_tests.rs"]
 mod fetch_view_tests;
+#[path = "focus_history_tests.rs"]
+mod focus_history_tests;
 #[path = "hosts_tests.rs"]
 mod hosts_tests;
 #[path = "keymap_tests.rs"]
@@ -3185,26 +3187,29 @@ async fn event_dropped_recovers_session_list_keymap_and_hosts() {
         )
         .await;
         let view_req = recv(&mut ws).await;
-        assert_eq!(view_req["method"], "session.view");
+        assert_eq!(view_req["method"], "session.attach");
         assert_eq!(view_req["payload"]["session_id"], SESSION);
         reply(
             &mut ws,
             &view_req,
             14,
             json!({
-                "session_id": SESSION,
-                "label": "snapshot",
-                "revision": 2,
-                "windows": [{
-                    "window_id": "w1",
-                    "focused_block_id": "b1",
-                    "layers": [{
-                        "kind": "tiled",
-                        "bounds": [0, 0, 1, 1],
-                        "layout": {"block_id": "b1"},
-                        "blocks": [{"block_id": "b1", "creator_name": "com.superlogical.terminal"}]
+                "client_id": "client:test",
+                "view": {
+                    "session_id": SESSION,
+                    "label": "snapshot",
+                    "revision": 2,
+                    "windows": [{
+                        "window_id": "w1",
+                        "focused_block_id": "b1",
+                        "layers": [{
+                            "kind": "tiled",
+                            "bounds": [0, 0, 1, 1],
+                            "layout": {"block_id": "b1"},
+                            "blocks": [{"block_id": "b1", "creator_name": "com.superlogical.terminal"}]
+                        }]
                     }]
-                }]
+                }
             }),
         )
         .await;
@@ -3400,7 +3405,7 @@ async fn event_dropped_with_session_id_routes_list_level_session_events() {
         // Let the initial background sweep probe OTHER and fail so OTHER stays unplaced
         // (in `m.sessions`, absent from `m.views`, marked in `state.viewed`). Under the old
         // bug, `event_dropped(session_destroyed, session_id=OTHER)` cleared `state.viewed`
-        // without removing OTHER from `m.sessions`, triggering a second `session.view` poll.
+        // without removing OTHER from `m.sessions`, triggering a second view poll.
         let initial_other_view = recv(&mut ws).await;
         assert_eq!(initial_other_view["method"], "session.view");
         assert_eq!(initial_other_view["payload"]["session_id"], OTHER);
@@ -3457,11 +3462,15 @@ async fn event_dropped_with_session_id_routes_list_level_session_events() {
         .await;
         let mut saw_other_view_after_destroy = false;
         let mut bg = |req: &Value| -> Option<(u64, Value)> {
-            if req["method"] == "session.view" && req["payload"]["session_id"] == OTHER {
+            if matches!(
+                req["method"].as_str(),
+                Some("session.view" | "session.attach")
+            ) && req["payload"]["session_id"] == OTHER
+            {
                 saw_other_view_after_destroy = true;
                 return Some((
                     13,
-                    json!({"session_id": OTHER, "revision": 1, "windows": []}),
+                    json!({"client_id": "client:test", "view": {"session_id": OTHER, "revision": 1, "windows": []}}),
                 ));
             }
             None
@@ -3620,12 +3629,12 @@ async fn recreated_block_and_session_ids_reread_layout_and_activity() {
         )
         .await;
         let view_req = recv(&mut ws).await;
-        assert_eq!(view_req["method"], "session.view");
+        assert_eq!(view_req["method"], "session.attach");
         reply(
             &mut ws,
             &view_req,
             12,
-            json!({"session_id": SESSION, "label": "snapshot", "revision": 2, "windows": []}),
+            json!({"client_id": "client:test", "view": {"session_id": SESSION, "label": "snapshot", "revision": 2, "windows": []}}),
         )
         .await;
         // Now b1 comes back with the same ID via session_view_changed.
@@ -3645,8 +3654,14 @@ async fn recreated_block_and_session_ids_reread_layout_and_activity() {
         )
         .await;
         let view_req2 = recv(&mut ws).await;
-        assert_eq!(view_req2["method"], "session.view");
-        reply(&mut ws, &view_req2, 14, view_with_b1(3)).await;
+        assert_eq!(view_req2["method"], "session.attach");
+        reply(
+            &mut ws,
+            &view_req2,
+            14,
+            json!({"client_id": "client:test", "view": view_with_b1(3)}),
+        )
+        .await;
         for expected in [
             "com.superlogical.terminal.program_status",
             "com.superlogical.terminal.title",
@@ -3700,25 +3715,20 @@ async fn recreated_block_and_session_ids_reread_layout_and_activity() {
         )
         .await;
 
-        // Background sweep may read `session.view` and `program_status` for the recreated
-        // session before or during `session.attach`; answer both transparently.
+        // Background sweep may read `session.attach` and `program_status` for the recreated
+        // session before or during `Select`; on API 19+, foreground `Select` also sends
+        // `session.view` to record focus. Answer both transparently and verify metadata re-reads.
         let mut bg_session = |req: &Value| -> Option<(u64, Value)> {
             match req["method"].as_str()? {
-                "session.view" => Some((17, view_with_b1(4))),
-                "com.superlogical.terminal.program_status" => Some((17, json!({}))),
+                "session.attach" => Some((
+                    18,
+                    json!({"client_id": "client:test", "view": view_with_b1(4)}),
+                )),
+                "session.view" => Some((18, view_with_b1(4))),
+                "com.superlogical.terminal.program_status" => Some((18, json!({}))),
                 _ => None,
             }
         };
-        let attach_req = recv_answering_sweep(&mut ws, &mut bg_session).await;
-        assert_eq!(attach_req["method"], "session.attach");
-        assert_eq!(attach_req["payload"]["session_id"], SESSION);
-        reply(
-            &mut ws,
-            &attach_req,
-            18,
-            json!({"client_id": "client:test", "view": view_with_b1(4)}),
-        )
-        .await;
 
         let mut saw_title = false;
         let mut saw_process = false;
@@ -3733,7 +3743,7 @@ async fn recreated_block_and_session_ids_reread_layout_and_activity() {
                     saw_process = true;
                     reply(&mut ws, &req, 18, json!({})).await;
                 }
-                other => panic!("unexpected request after attach: {other}"),
+                other => panic!("unexpected request after select: {other}"),
             }
         }
         phase2_tx.send(()).unwrap();
@@ -3805,8 +3815,8 @@ async fn event_dropped_cancels_superseded_in_flight_status_sweep_read() {
             })
         };
 
-        // 1. Background sweep loads OTHER's view, then starts a detached `program_status` read
-        //    for b2 (`req1`). Keep `req1` in flight without replying yet.
+        // 1. Background sweep loads unattached OTHER's view via `session.view` (never attaching
+        //    unopened sessions), then starts a detached `program_status` read for b2 (`req1`).
         let view_req1 = recv(&mut ws).await;
         assert_eq!(view_req1["method"], "session.view");
         assert_eq!(view_req1["payload"]["session_id"], OTHER);
