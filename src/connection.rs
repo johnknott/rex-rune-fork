@@ -270,6 +270,8 @@ pub struct HostModel {
     pub performs: Vec<perform::Pending>,
     /// Epoch-scoped prompt transitions, oldest first; drain once in the consumer.
     pub prompt_events: VecDeque<prompt::PromptEvent>,
+    /// Number of `client.action` calls currently awaiting a server response on this connection.
+    pub actions_in_flight: usize,
     /// This launch's downloads from the host, oldest first; see [`crate::download`].
     pub downloads: Vec<crate::download::Transfer>,
     pub connection_epoch: u64,
@@ -875,6 +877,7 @@ impl Shared {
             if !connected {
                 m.clipboard = None;
                 m.prompt_events.clear();
+                m.actions_in_flight = 0;
                 m.keymap = None;
                 m.keymap_revision += 1;
             }
@@ -1020,6 +1023,31 @@ impl HostConnection {
         label: String,
         ssh_auth_sock: Option<PathBuf>,
     ) -> Self {
+        Self::spawn_with_prompts(
+            endpoint,
+            preferred,
+            create,
+            block,
+            visible,
+            theme,
+            label,
+            ssh_auth_sock,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_prompts(
+        endpoint: String,
+        preferred: Option<String>,
+        create: Option<(String, Option<String>)>,
+        block: Option<String>,
+        visible: bool,
+        theme: Option<SetTheme>,
+        label: String,
+        ssh_auth_sock: Option<PathBuf>,
+        prompts_enabled: bool,
+    ) -> Self {
         Self::spawn_internal(
             endpoint,
             Startup {
@@ -1029,6 +1057,7 @@ impl HostConnection {
                 theme,
                 label,
                 ssh_auth_sock,
+                prompts_enabled,
                 #[cfg(test)]
                 ssh_program: None,
                 #[cfg(test)]
@@ -1853,6 +1882,7 @@ struct Startup {
     block: Option<String>,
     theme: Option<SetTheme>,
     ssh_auth_sock: Option<PathBuf>,
+    prompts_enabled: bool,
     #[cfg(test)]
     ssh_program: Option<PathBuf>,
     #[cfg(test)]
@@ -1873,6 +1903,7 @@ async fn run_host(
         mut theme,
         label,
         mut ssh_auth_sock,
+        mut prompts_enabled,
         #[cfg(test)]
         ssh_program,
         #[cfg(test)]
@@ -1881,7 +1912,6 @@ async fn run_host(
     let mut token: Option<String> = None;
     let mut workers = HashMap::<String, PaneWorker>::new();
     let mut retry = 0;
-    let mut prompts_enabled = false;
     let mut deferred_commands = VecDeque::new();
     let mut prefetch = prefetch::Prefetch::default();
     let mut keymap: Option<Box<keymap::Declaration>> = None;
@@ -1932,6 +1962,7 @@ async fn run_host(
                 m.connection_epoch += 1;
                 m.performs.clear();
                 m.prompt_events.clear();
+                m.actions_in_flight = 0;
                 m.view_fetches.clear();
                 m.client_id = identity.id.clone();
                 m.protocol.api_revision = control.welcome().api_revision;
@@ -2495,7 +2526,10 @@ async fn run_host(
         tunnel = None;
         if matches!(result, Ok(true)) {
             deferred_commands.clear();
-            shared.update(|m| m.prompt_events.clear());
+            shared.update(|m| {
+                m.prompt_events.clear();
+                m.actions_in_flight = 0;
+            });
             return Ok(());
         }
         shared.update(|m| {
