@@ -326,13 +326,21 @@ fn poll(s: &mut Workspace, clock: f64, tx: &mut Tx) -> bool {
     if s.notices.iter().any(|n| !n.sticky) {
         tx.wake_after(Duration::from_secs(1));
     }
-    // A pane waiting for a frame at its size draws anyway at its deadline; be awake for it.
+    // A pane waiting for a frame at its size draws anyway at its deadline, and a pane with
+    // pending local-echo predictions wakes to underline or expire them.
     let now = std::time::Instant::now();
     for term in s.terminals.values_mut() {
         if term.draw_anyway(now) {
             changed = true;
         } else if let Some(deadline) = term.draws_anyway_at() {
             tx.wake_after(deadline - now);
+        }
+        let (echo_changed, echo_wake) = term.poll_local_echo(now);
+        if echo_changed {
+            changed = true;
+        }
+        if let Some(wake_at) = echo_wake {
+            tx.wake_after(wake_at.saturating_duration_since(now));
         }
     }
     changed

@@ -14,6 +14,10 @@ use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     task::Poll,
     time::{Duration, Instant},
 };
@@ -28,6 +32,24 @@ pub(super) const MAX_IN_FLIGHT: usize = 64;
 /// Maximum time the oldest unanswered input request may wait without progress before failing.
 pub(super) const TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Upper clamp for a single RTT sample (in ms) so one pause cannot poison the EWMA for long.
+const MAX_RTT_SAMPLE_MS: u32 = 5_000;
+
+/// Record one measured round-trip duration into a lock-free host RTT slot.
+///
+/// Encoding: `0` means unmeasured; any positive value `v` encodes `v - 1` milliseconds.
+pub(super) fn record_rtt(slot: &AtomicU32, elapsed: Duration) {
+    let sample = elapsed.as_millis().min(u128::from(MAX_RTT_SAMPLE_MS)) as u32;
+    let prev = slot.load(Ordering::Relaxed);
+    let next = if prev == 0 {
+        sample
+    } else {
+        let srtt = prev - 1;
+        (srtt * 3 + sample) / 4
+    };
+    slot.store(next.saturating_add(1), Ordering::Relaxed);
+}
+
 struct InFlight {
     reply: oneshot::Receiver<String>,
     sent_at: Instant,
@@ -38,22 +60,33 @@ pub(super) struct Queue {
     last_head_progress: Option<Instant>,
     timer: Pin<Box<Sleep>>,
     timeout: Duration,
+    rtt_ms: Arc<AtomicU32>,
 }
 
 impl Default for Queue {
     fn default() -> Self {
-        Self::with_timeout(TIMEOUT)
+        Self::with_rtt(Arc::new(AtomicU32::new(0)))
     }
 }
 
 impl Queue {
-    fn with_timeout(timeout: Duration) -> Self {
+    pub(super) fn with_rtt(rtt_ms: Arc<AtomicU32>) -> Self {
+        Self::with_timeout_and_rtt(TIMEOUT, rtt_ms)
+    }
+
+    fn with_timeout_and_rtt(timeout: Duration, rtt_ms: Arc<AtomicU32>) -> Self {
         Self {
             in_flight: VecDeque::new(),
             last_head_progress: None,
             timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
             timeout,
+            rtt_ms,
         }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(timeout: Duration) -> Self {
+        Self::with_timeout_and_rtt(timeout, Arc::new(AtomicU32::new(0)))
     }
 
     pub fn in_flight(&self) -> usize {
@@ -128,7 +161,7 @@ impl Queue {
         let Ok((index, reply)) = outcome else {
             return Err(anyhow!("Rex request timed out; action was not retried"));
         };
-        self.in_flight.remove(index);
+        let removed = self.in_flight.remove(index);
         if self.in_flight.is_empty() {
             self.last_head_progress = None;
         } else if index == 0 {
@@ -138,8 +171,16 @@ impl Queue {
         let text = reply
             .map_err(|_| anyhow!("Rex control connection closed while awaiting input reply"))?;
         match crate::transport::detached_result::<Value>(&text) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(entry) = removed {
+                    record_rtt(&self.rtt_ms, entry.sent_at.elapsed());
+                }
+                Ok(())
+            }
             Err(error @ rexrs::Error::Api(_)) => {
+                if let Some(entry) = removed {
+                    record_rtt(&self.rtt_ms, entry.sent_at.elapsed());
+                }
                 shared.update(|m| m.notice = Some(format!("{error:#}")));
                 Ok(())
             }
@@ -264,5 +305,18 @@ mod tests {
         drop(tx);
         let err = queue.finished(&shared).await.unwrap_err();
         assert!(err.to_string().contains("closed"), "{err:#}");
+    }
+
+    #[test]
+    fn ewma_rtt_seeds_smooths_and_caps_extremes() {
+        let slot = AtomicU32::new(0);
+        record_rtt(&slot, Duration::from_millis(200));
+        assert_eq!(slot.load(Ordering::Relaxed), 201);
+        record_rtt(&slot, Duration::from_millis(120));
+        // (200 * 3 + 120) / 4 = 180 -> stored as 181
+        assert_eq!(slot.load(Ordering::Relaxed), 181);
+        record_rtt(&slot, Duration::from_secs(30));
+        // Clamped to 5000ms: (180 * 3 + 5000) / 4 = 1385 -> stored as 1386
+        assert_eq!(slot.load(Ordering::Relaxed), 1386);
     }
 }

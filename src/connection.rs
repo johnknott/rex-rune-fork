@@ -214,16 +214,50 @@ pub struct TerminalSender {
     host: flume::Sender<HostCommand>,
     session: String,
     block: String,
+    rtt_ms: Arc<std::sync::atomic::AtomicU32>,
 }
 impl TerminalSender {
     /// Commands for one block, sent through its host's worker.
     pub fn new(host: flume::Sender<HostCommand>, session: String, block: String) -> Self {
+        Self::with_rtt(
+            host,
+            session,
+            block,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )
+    }
+
+    fn with_rtt(
+        host: flume::Sender<HostCommand>,
+        session: String,
+        block: String,
+        rtt_ms: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
         Self {
             host,
             session,
             block,
+            rtt_ms,
         }
     }
+
+    /// Smoothed control-connection round-trip time in milliseconds, or `None` before the first
+    /// reply arrives on the current connection. Lock-free read.
+    pub fn rtt_ms(&self) -> Option<u32> {
+        match self.rtt_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            v => Some(v - 1),
+        }
+    }
+
+    /// Override the measured RTT slot (for deterministic tests).
+    pub fn set_rtt_ms(&self, ms: Option<u32>) {
+        self.rtt_ms.store(
+            ms.map_or(0, |v| v.saturating_add(1)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub fn focus(&self) -> Result<()> {
         self.host
             .send(HostCommand::Request {
@@ -248,6 +282,17 @@ pub struct Connection {
     pub model: Arc<Mutex<Model>>,
     pub commands: TerminalSender,
     pub wake: flume::Receiver<()>,
+}
+impl Connection {
+    /// Smoothed control-connection round-trip time in milliseconds, or `None` if unmeasured.
+    pub fn rtt_ms(&self) -> Option<u32> {
+        self.commands.rtt_ms()
+    }
+
+    /// Override the measured RTT slot (for deterministic tests).
+    pub fn set_rtt_ms(&self, ms: Option<u32>) {
+        self.commands.set_rtt_ms(ms);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1484,6 +1529,7 @@ fn reconcile(
     endpoint: &str,
     shared: &Shared,
     sender: &flume::Sender<HostCommand>,
+    rtt_ms: &Arc<std::sync::atomic::AtomicU32>,
     workers: &mut HashMap<String, PaneWorker>,
 ) {
     let model = shared.model.lock().expect("host model").clone();
@@ -1543,7 +1589,12 @@ fn reconcile(
                 let (wake, receiver) = flume::bounded(1);
                 let connection = Connection {
                     model: state.clone(),
-                    commands: TerminalSender::new(sender.clone(), session_id.clone(), id.clone()),
+                    commands: TerminalSender::with_rtt(
+                        sender.clone(),
+                        session_id.clone(),
+                        id.clone(),
+                        rtt_ms.clone(),
+                    ),
                     wake: receiver,
                 };
                 shared.update(|m| {
@@ -2398,6 +2449,7 @@ async fn run_host(
     let mut hosts_reads = hosts::Reader::default();
     let mut directory_reads = directory::Reader::default();
     let mut view_fetches = view_fetch::Reader::default();
+    let rtt_ms = Arc::new(std::sync::atomic::AtomicU32::new(0));
     // An ssh:// host is reached through a forward of its Rex socket; every attempt opens a
     // fresh one, and its end is a disconnect like any other.
     let ssh = crate::ssh::Target::parse(&configured)?;
@@ -2480,7 +2532,7 @@ async fn run_host(
             let mut state = ControlState { prompts_enabled, ..Default::default() };
             let mut sweep = status_sweep::Reader::default();
             let mut downloads = downloads::Downloads::default();
-            let mut inputs = input::Queue::default();
+            let mut inputs = input::Queue::with_rtt(rtt_ms.clone());
             let mut busy_since = Some(Instant::now());
             let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
             let started = Instant::now();
@@ -2497,6 +2549,7 @@ async fn run_host(
                     return Err(error);
                 }
             };
+            input::record_rtt(&rtt_ms, started.elapsed());
             apply_bootstrap(shared, &mut state, reply, started);
             if let Some((label, shell)) = create.take() {
                 // Take before calling: an uncertain response must never create twice.
@@ -2550,7 +2603,7 @@ async fn run_host(
             state.prune(&shared.model.lock().expect("host model"));
             shared.update(|m| m.ssh_problem = None);
             shared.status("Connected", true);
-            reconcile(&endpoint, shared, &sender, &mut workers);
+            reconcile(&endpoint, shared, &sender, &rtt_ms, &mut workers);
             for (block, worker) in &workers {
                 if let Some((cols, rows, w, h)) = worker.size {
                     send_input(
@@ -2565,7 +2618,7 @@ async fn run_host(
                     .await?;
                 }
             }
-            reconcile(&endpoint, shared, &sender, &mut workers);
+            reconcile(&endpoint, shared, &sender, &rtt_ms, &mut workers);
             declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
             query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
             // Restore terminal sizes and state before a best-effort keymap can wait.
@@ -2608,7 +2661,7 @@ async fn run_host(
                         )
                         .await?;
                         state.prune(&shared.model.lock().expect("host model"));
-                        reconcile(&endpoint, shared, &sender, &mut workers);
+                        reconcile(&endpoint, shared, &sender, &rtt_ms, &mut workers);
                         declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
                         query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                         continue;
@@ -2798,7 +2851,7 @@ async fn run_host(
                         )
                         .await?;
                         state.prune(&shared.model.lock().expect("host model"));
-                        reconcile(&endpoint, shared, &sender, &mut workers);
+                        reconcile(&endpoint, shared, &sender, &rtt_ms, &mut workers);
                         declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
                         query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                     }
@@ -2928,7 +2981,7 @@ async fn run_host(
                                 }
                             }
                             state.prune(&shared.model.lock().expect("host model"));
-                            reconcile(&endpoint, shared, &sender, &mut workers);
+                            reconcile(&endpoint, shared, &sender, &rtt_ms, &mut workers);
                             declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
                             query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                             continue;
@@ -3092,7 +3145,7 @@ async fn run_host(
                             CommandEffect::Full => {
                                 ports::reconcile_selected(shared, &mut state);
                                 state.prune(&shared.model.lock().expect("host model"));
-                                reconcile(&endpoint, shared, &sender, &mut workers);
+                                reconcile(&endpoint, shared, &sender, &rtt_ms, &mut workers);
                                 declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
                                 query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                             }
@@ -3102,6 +3155,7 @@ async fn run_host(
             }
         }.await;
         tunnel = None;
+        rtt_ms.store(0, std::sync::atomic::Ordering::Relaxed);
         if matches!(result, Ok(true)) {
             deferred_commands.clear();
             shared.update(|m| {

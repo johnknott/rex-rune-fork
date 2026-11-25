@@ -685,6 +685,7 @@ impl Workspace {
                     .expect("terminal wake thread");
                 let mut term = Term::new(connection.clone());
                 term.set_cursor_style(self.settings.terminal.cursor_style.shape());
+                term.set_local_echo(self.settings.terminal.local_echo);
                 term.cache_images(self.images.as_ref());
                 self.terminals.insert(key, term);
             }
@@ -892,6 +893,7 @@ impl Workspace {
             self.cancel_layer_drag();
             for term in self.terminals.values_mut() {
                 term.end_selection();
+                term.clear_local_echo();
             }
         }
         if focused {

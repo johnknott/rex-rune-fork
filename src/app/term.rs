@@ -12,12 +12,13 @@ use rex_rune::{
     connection::{Command, Connection},
     links::Link,
     settings::{
-        terminal::{SelectionColor, TerminalConfig},
+        terminal::{LocalEcho, SelectionColor, TerminalConfig},
         typography::Typography,
     },
     terminal::{
         Cell, CopyModeOp, CopyYank, CursorShape, Frame, SelectionUnit,
         graphics::{Image as TermImage, ImagePixels},
+        local_echo,
     },
     terminal_theme::{TerminalTheme, is_light},
 };
@@ -90,6 +91,9 @@ pub struct Term {
     last_copy_yank: Option<(u64, u64)>,
     /// Defense-in-depth: a script prompt or Ports can block direct PTY input commands.
     pub panel_blocks_input: bool,
+    /// Opt-in Mosh-style speculative local echo state (render-only overlay).
+    local_echo: local_echo::Predictor,
+    local_echo_mode: LocalEcho,
 }
 
 #[derive(Clone, Copy)]
@@ -281,7 +285,26 @@ impl Term {
             pending_copy_yank: None,
             last_copy_yank: None,
             panel_blocks_input: false,
+            local_echo: local_echo::Predictor::default(),
+            local_echo_mode: LocalEcho::Off,
         }
+    }
+
+    pub fn set_local_echo(&mut self, mode: LocalEcho) {
+        self.local_echo_mode = mode;
+        if mode == LocalEcho::Off {
+            self.local_echo.reset();
+        }
+    }
+
+    pub fn clear_local_echo(&mut self) {
+        self.local_echo.reset_epoch();
+    }
+
+    /// Advance local-echo timers (stale expiry and adaptive underline); returns `(redraw, wake_at)`.
+    pub fn poll_local_echo(&mut self, now: Instant) -> (bool, Option<Instant>) {
+        self.local_echo
+            .poll(self.local_echo_mode, self.connection.rtt_ms(), now)
     }
 
     pub fn refresh(&mut self) {
@@ -307,6 +330,7 @@ impl Term {
             self.copy_wanted = None;
             self.copy_mode_active = None;
             self.pending_copy_yank = None;
+            self.local_echo.reset();
             self.restore_generation = generation;
         }
         if self
@@ -340,9 +364,22 @@ impl Term {
                 }
             }
         }
+        let frame_changed = match (&self.frame, &frame) {
+            (Some(prev), Some(next)) => !Arc::ptr_eq(prev, next),
+            (None, Some(_)) => true,
+            _ => false,
+        };
         self.initial_size
             .observe(frame.as_ref().map(|frame| (frame.cols, frame.rows)));
         self.frame = frame;
+        if frame_changed && let Some(frame) = &self.frame {
+            self.local_echo.reconcile(
+                frame,
+                self.local_echo_mode,
+                self.connection.rtt_ms(),
+                Instant::now(),
+            );
+        }
         // The same cell may hold a different link, or none, after output.
         if let Some((index, _)) = self.link.take() {
             self.link = self
@@ -455,9 +492,38 @@ impl Term {
                     CopyModeOp::End,
                 )));
         }
+        let echo_action = match &command {
+            Command::Key(payload) => local_echo::classify_key(payload),
+            Command::KeyWithPrefix { .. }
+            | Command::SendKey(_)
+            | Command::Paste(_)
+            | Command::Reset
+            | Command::Clear
+            | Command::CopyMode(_)
+            | Command::Scroll(_)
+            | Command::PromptStep(_) => local_echo::InputAction::Reset,
+            Command::Mouse(payload) if payload["action"].as_str() == Some("press") => {
+                local_echo::InputAction::Reset
+            }
+            _ => local_echo::InputAction::Ignore,
+        };
         if let Err(error) = self.connection.commands.try_send(command) {
             self.notice = Some(format!("Input not sent: {error}"));
             return false;
+        }
+        if self.local_echo_mode != LocalEcho::Off && echo_action != local_echo::InputAction::Ignore
+        {
+            if self.status().live {
+                self.local_echo.on_input(
+                    echo_action,
+                    self.frame.as_deref(),
+                    self.local_echo_mode,
+                    self.connection.rtt_ms(),
+                    Instant::now(),
+                );
+            } else {
+                self.local_echo.reset_epoch();
+            }
         }
         true
     }
@@ -1626,6 +1692,103 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
             grid = grid.child(mark);
         }
     }
+    let echo_overlay = (look.cursor == Some(CursorLook::Block)
+        && frame.copy.is_none()
+        && term.preedit.is_empty()
+        && term.selection.is_none())
+    .then(|| {
+        term.local_echo.overlay(
+            frame,
+            term.local_echo_mode,
+            term.connection.rtt_ms(),
+            Instant::now(),
+        )
+    })
+    .flatten();
+    if let Some(ov) = &echo_overlay
+        && !ov.cells.is_empty()
+        && (ov.row as usize) >= start
+        && (ov.row as usize) < start + visible
+    {
+        let (ox, py) = (
+            ov.start_col as f32 * cw,
+            (ov.row as usize - start) as f32 * ch,
+        );
+        let ow = ov.cells.len() as f32 * cw;
+        let predicted_style = RunStyle {
+            fg: frame.fg,
+            bold: false,
+            italic: false,
+            faint: false,
+            underline: Underline::None,
+            underline_color: None,
+            overline: false,
+            strike: false,
+        };
+        let mut layer = el()
+            .key(format!("{key}/local-echo"))
+            .absolute(ox, py)
+            .size(ow, ch)
+            .instant_changes()
+            .child(el().absolute(0., 0.).size(ow, ch).fill(rgb(body)));
+        let mut segment: Option<Segment> = None;
+        for (offset, cell) in ov.cells.iter().enumerate() {
+            let Some(ch) = cell.ch else {
+                if let Some(done) = segment.take().and_then(|s| s.finish(m)) {
+                    layer = layer.child(done);
+                }
+                continue;
+            };
+            if fits_cell(ch, false, false, m) {
+                let mut buf = [0u8; 4];
+                segment
+                    .get_or_insert_with(|| Segment::new(offset))
+                    .push(ch.encode_utf8(&mut buf), predicted_style);
+            } else {
+                if let Some(done) = segment.take().and_then(|s| s.finish(m)) {
+                    layer = layer.child(done);
+                }
+                layer = layer.child(glyph_run(
+                    ch.to_string(),
+                    predicted_style,
+                    offset as f32 * cw,
+                    0.,
+                    m,
+                ));
+            }
+        }
+        if let Some(done) = segment.and_then(|s| s.finish(m)) {
+            layer = layer.child(done);
+        }
+        let underline_style = RunStyle {
+            underline: Underline::Single,
+            underline_color: Some(mix(frame.fg, body, 0.45)),
+            ..predicted_style
+        };
+        let line = ch - 2. * m.leading;
+        let mut u_start = 0;
+        while u_start < ov.cells.len() {
+            if !ov.cells[u_start].underline {
+                u_start += 1;
+                continue;
+            }
+            let mut u_end = u_start + 1;
+            while u_end < ov.cells.len() && ov.cells[u_end].underline {
+                u_end += 1;
+            }
+            let width = (u_end - u_start) as f32 * cw;
+            let shape = decoration_shape(&underline_style, width, line, m.px);
+            if !shape.is_empty() {
+                layer = layer.child(
+                    canvas(shape)
+                        .absolute(u_start as f32 * cw, m.leading)
+                        .size(width, line),
+                );
+            }
+            u_start = u_end;
+        }
+        grid = grid.child(layer);
+    }
     if let Some(view) = frame.copy {
         let (x, y) = view.cursor;
         if let Some(cursor_look) = look.cursor
@@ -1674,7 +1837,7 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
                 }
             }
         }
-    } else if let Some((x, y)) = frame.cursor
+    } else if let Some((x, y)) = echo_overlay.as_ref().map(|ov| ov.cursor).or(frame.cursor)
         && let Some(cursor_look) = look.cursor
         && (y as usize) >= start
         && (y as usize) < start + visible
@@ -1689,18 +1852,39 @@ pub fn grid(key: &str, term: &Term, m: &Metrics, look: GridLook) -> El {
         };
         let cursor = cursor_el(shape, (px, py), m.cell, color).key(format!("{key}/cursor"));
         grid = grid.child(cursor);
-        if shape == CursorShape::Block
-            && let Some(cell) =
+        if shape == CursorShape::Block {
+            let cursor_fg = colors
+                .cursor_text
+                .filter(|_| body == colors.background)
+                .unwrap_or(body);
+            let predicted_under_cursor = echo_overlay.as_ref().and_then(|ov| {
+                (y == ov.row && x >= ov.start_col)
+                    .then(|| ov.cells.get(usize::from(x - ov.start_col)))
+                    .flatten()
+            });
+            if let Some(pred) = predicted_under_cursor {
+                if let Some(ch) = pred.ch.filter(|&c| c != ' ') {
+                    let style = RunStyle {
+                        fg: cursor_fg,
+                        bold: false,
+                        italic: false,
+                        faint: false,
+                        underline: Underline::None,
+                        underline_color: None,
+                        overline: false,
+                        strike: false,
+                    };
+                    grid = grid.child(glyph_run(ch.to_string(), style, px, py, m));
+                }
+            } else if let Some(cell) =
                 cell.filter(|c| !c.text.is_empty() && !c.text.starts_with('\u{10eeee}'))
-        {
-            let style = RunStyle {
-                fg: colors
-                    .cursor_text
-                    .filter(|_| body == colors.background)
-                    .unwrap_or(body),
-                ..RunStyle::of(cell, frame.bg, body)
-            };
-            grid = grid.child(glyph_run(cell.text.clone(), style, px, py, m));
+            {
+                let style = RunStyle {
+                    fg: cursor_fg,
+                    ..RunStyle::of(cell, frame.bg, body)
+                };
+                grid = grid.child(glyph_run(cell.text.clone(), style, px, py, m));
+            }
         }
     }
     if let Some(option_as_alt) = look.ime {

@@ -14,6 +14,7 @@ use std::{
 
 pub mod copy_mode;
 pub mod graphics;
+pub mod local_echo;
 pub mod search;
 pub mod selection;
 
@@ -289,6 +290,10 @@ pub struct Frame {
     pub cursor_shape: CursorShape,
     /// The program asked for mouse reports (DEC 9, 1000, 1002 or 1003).
     pub mouse_tracking: bool,
+    /// True while the alternate screen buffer (DEC 47/1047/1049) is active.
+    pub alt_screen: bool,
+    /// True when the viewport is pinned to the live bottom screen (not scrolled into scrollback).
+    pub viewport_active: bool,
     pub images: Vec<graphics::Image>,
     pub cell_pixels: [u32; 2],
     pub selection_rows: Vec<Option<(usize, usize)>>,
@@ -475,6 +480,8 @@ impl Renderer {
                 _ => CursorShape::Block,
             },
             mouse_tracking: terminal.is_mouse_tracking()?,
+            alt_screen: terminal.active_screen()? == ghostty_vt::screen::Screen::Alternate,
+            viewport_active: terminal.is_viewport_active()?,
             images: self.images.frame(terminal, &snapshot)?,
             cell_pixels: [
                 terminal.width_px()? / u32::from(snapshot.cols()?).max(1),

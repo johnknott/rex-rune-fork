@@ -4,7 +4,7 @@ use super::*;
 use crate::app::{panel::SettingsSection, select_copy::memory, term};
 use rex_rune::{
     connection::Command,
-    settings::terminal::{CursorStyle, OptionKey, SelectionColor},
+    settings::terminal::{CursorStyle, LocalEcho, OptionKey, SelectionColor},
     terminal::{CursorShape, Renderer, selection},
 };
 use std::sync::Arc;
@@ -1600,5 +1600,167 @@ fn keep_program_backgrounds_saves_locally_and_fills_osc11_panes_without_changing
     );
     assert!(other_commands(&host_rx).is_empty());
     assert!(other_commands(&term_rx).is_empty());
+    std::fs::remove_file(&rt.state.settings_path).ok();
+}
+
+#[test]
+fn local_echo_defaults_off_persists_from_settings_and_renders_confirmed_predictions() {
+    // Settings → Terminal → Keyboard: defaults Off, persists Adaptive/Always, omits Off on save.
+    let (mut ws, host_rx) = tabbed_workspace("single");
+    let (sender, term_rx) = flume::unbounded();
+    framed_terminal(&mut ws, "block:a", &sender, b"$ ");
+    ws.perform(Intent::Settings, &mut rune::Tx::default());
+    ws.open_section(SettingsSection::Terminal);
+    let mut rt = runtime_at(ws, (1440., 1000.));
+    settle(&mut rt);
+
+    assert_eq!(rt.state.settings.terminal.local_echo, LocalEcho::Off);
+    choose(&mut rt, "local-echo", "Adaptive");
+    assert_eq!(rt.state.settings.terminal.local_echo, LocalEcho::Adaptive);
+    assert_eq!(
+        Settings::load(&rt.state.settings_path)
+            .unwrap()
+            .terminal
+            .local_echo,
+        LocalEcho::Adaptive
+    );
+    choose(&mut rt, "local-echo", "Always");
+    assert_eq!(rt.state.settings.terminal.local_echo, LocalEcho::Always);
+    choose(&mut rt, "local-echo", "Off");
+    assert_eq!(rt.state.settings.terminal.local_echo, LocalEcho::Off);
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rt.state.settings_path).unwrap()).unwrap();
+    assert!(
+        raw.get("terminal")
+            .and_then(|t| t.get("local_echo"))
+            .is_none(),
+        "default Off stays omitted in saved settings: {raw}"
+    );
+    assert!(other_commands(&host_rx).is_empty());
+    assert!(other_commands(&term_rx).is_empty());
+    std::fs::remove_file(&rt.state.settings_path).ok();
+
+    // Headless pane rendering: Off predicts nothing; Always hides unconfirmed epoch (password
+    // safety), draws confirmed predictions immediately with advanced cursor, and settles on echo.
+    let (mut ws, _host_rx) = tabbed_workspace("single");
+    let (sender, _term_rx) = flume::unbounded();
+    let mut terminal = framed_terminal(&mut ws, "block:a", &sender, b"$ ");
+    let mut renderer = Renderer::new().unwrap();
+    let mut rt = runtime(ws);
+    settle(&mut rt);
+
+    let key = rt.state.term_key("block:a");
+    let cell = term::metrics(rt.state.settings.font_size).cell;
+    let grid = rect(&rt, "grid:block:a");
+    let has_overlay = |rt: &Runtime<Workspace>| {
+        rt.elements()
+            .iter()
+            .any(|e| !e.exiting && e.key.as_deref() == Some("gblock:a/local-echo"))
+    };
+    let cursor_col = |rt: &Runtime<Workspace>| {
+        ((rect(rt, "gblock:a/cursor")[0] - grid[0]) / cell.0).round() as i32
+    };
+    let send_char = |rt: &mut Runtime<Workspace>, ch: char| {
+        let key_id = key.clone();
+        rt.update(move |s, _| {
+            let text = ch.to_string();
+            s.terminals
+                .get_mut(&key_id)
+                .unwrap()
+                .try_send(Command::Key(serde_json::json!({
+                    "key": format!("key_{ch}"),
+                    "mods": "",
+                    "consumed_mods": "",
+                    "text": text,
+                    "unshifted_codepoint": ch as u32,
+                    "composing": false,
+                    "action": "press",
+                })));
+        });
+        settle(rt);
+    };
+    let mut push_server =
+        |rt: &mut Runtime<Workspace>, terminal: &mut ghostty_vt::Terminal, bytes: &[u8]| {
+            terminal.vt_write(bytes);
+            let frame = Arc::new(renderer.frame(terminal).unwrap());
+            let key_id = key.clone();
+            rt.update(move |s, _| {
+                let term = s.terminals.get_mut(&key_id).unwrap();
+                term.connection.model.lock().unwrap().frame = Some(frame);
+                term.refresh();
+            });
+            settle(rt);
+        };
+
+    assert_eq!(cursor_col(&rt), 2);
+    // Default Off: typing produces no overlay and does not move cursor locally.
+    send_char(&mut rt, 'a');
+    assert!(!has_overlay(&rt));
+    assert_eq!(cursor_col(&rt), 2);
+
+    // Enable Always: first char in unconfirmed epoch remains hidden (password safety).
+    rt.update(|s, _| s.set_local_echo(LocalEcho::Always));
+    settle(&mut rt);
+    send_char(&mut rt, 'a');
+    assert!(
+        !has_overlay(&rt),
+        "unconfirmed first character must not render locally"
+    );
+    assert_eq!(cursor_col(&rt), 2);
+
+    // Server echoes 'a' -> epoch confirmed; subsequent 'b' and 'c' appear immediately.
+    push_server(&mut rt, &mut terminal, b"a");
+    assert_eq!(cursor_col(&rt), 3);
+    assert!(!has_overlay(&rt));
+
+    send_char(&mut rt, 'b');
+    send_char(&mut rt, 'c');
+    assert!(
+        has_overlay(&rt),
+        "confirmed predictions must render at once"
+    );
+    assert_eq!(
+        cursor_col(&rt),
+        5,
+        "cursor must advance optimistically across predicted cells"
+    );
+    let overlay_rect = rect(&rt, "gblock:a/local-echo");
+    assert!(
+        (overlay_rect[0] - (grid[0] + 3. * cell.0)).abs() < 1.0,
+        "overlay starts at col 3: {overlay_rect:?}"
+    );
+    assert!(
+        (overlay_rect[2] - 2. * cell.0).abs() < 1.0,
+        "overlay covers 2 cells: {overlay_rect:?}"
+    );
+
+    // Server echoes "bc" -> overlay clears cleanly and cursor remains at col 5.
+    push_server(&mut rt, &mut terminal, b"bc");
+    assert!(!has_overlay(&rt), "overlay must clear once server confirms");
+    assert_eq!(cursor_col(&rt), 5);
+
+    // Enter resets the epoch so a subsequent password prompt never echoes locally.
+    let key_id = key.clone();
+    rt.update(move |s, _| {
+        s.terminals
+            .get_mut(&key_id)
+            .unwrap()
+            .try_send(Command::Key(serde_json::json!({
+                "key": "enter",
+                "mods": "",
+                "consumed_mods": "",
+                "text": "\n",
+                "unshifted_codepoint": 10,
+                "composing": false,
+                "action": "press",
+            })));
+    });
+    settle(&mut rt);
+    push_server(&mut rt, &mut terminal, b"\r\nPassword: ");
+    send_char(&mut rt, 's');
+    assert!(
+        !has_overlay(&rt),
+        "typing after Enter on a new prompt must stay hidden until echoed"
+    );
     std::fs::remove_file(&rt.state.settings_path).ok();
 }
