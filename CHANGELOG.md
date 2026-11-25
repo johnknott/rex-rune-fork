@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Rex Lua prompt protocol groundwork (Part of [#144](https://github.com/shuv1337/rex-rune/issues/144)).** Adds an opt-in connection model for `rex.ui` input and pick requests, bounded and cleaned display data, and epoch-scoped replies. The shipped app still refuses prompts until it has a UI.
+
+### Fixed
+
+- **Lua actions no longer stall their own prompt.** The control worker keeps listening for `rex.ui` while `client.action` is pending, so it can decline or answer immediately and still apply the action's eventual response.
+
 ## 0.12.0 - 2026-11-24
 
 Rex Server API revision 21 support (`0.1.0-snapshot.2562` and `0.1.0-snapshot.2563`), full shared Rex host list sync and writes (`#145`), keyboard-driven Vim copy mode (`#149`), scriptable `client.tab.mute` (`#163`), and a Wayland idle IME redraw loop fix (`#167`).

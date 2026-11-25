@@ -6,10 +6,10 @@ use crate::{
 };
 use activity::{BlockEvent, DesktopNotice, StatusRecord, TerminalProgress};
 use anyhow::{Context, Result};
-use rexrs::api::{BlockMethod, session, terminal::SetTheme};
+use rexrs::api::{BlockMethod, Method, session, terminal::SetTheme};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -268,6 +268,8 @@ pub struct HostModel {
     /// Taken once before cloning the worker model into the UI.
     pub client_actions: Vec<actions::Queued>,
     pub performs: Vec<perform::Pending>,
+    /// Epoch-scoped prompt transitions, oldest first; drain once in the consumer.
+    pub prompt_events: VecDeque<prompt::PromptEvent>,
     /// This launch's downloads from the host, oldest first; see [`crate::download`].
     pub downloads: Vec<crate::download::Transfer>,
     pub connection_epoch: u64,
@@ -502,6 +504,14 @@ pub enum HostCommand {
         call_id: String,
         outcome: perform::Outcome,
     },
+    /// Opt in only while a prompt consumer is available. Off by default.
+    Prompts(bool),
+    /// Answer an offered prompt on the same connection, never replayed.
+    PromptReply {
+        epoch: u64,
+        call_id: String,
+        answer: prompt::PromptAnswer,
+    },
     Keymap(Box<keymap::Declaration>),
     /// Read the server's version once on each connection from now on, and its status again
     /// when the server says it changed; see [`server_info`]. Read-only, and a refusal is quiet.
@@ -636,6 +646,9 @@ struct PendingTicket {
 struct ControlState {
     // Earliest possible arrival of events buffered during the preceding busy step.
     performs_since: Option<Instant>,
+    prompts_enabled: bool,
+    prompts: prompt::PromptState,
+    actions: actions::Waits,
     bootstrap_seq: u64,
     list_seq: u64,
     view_seq: HashMap<String, u64>,
@@ -667,6 +680,22 @@ struct ControlState {
 }
 
 impl ControlState {
+    async fn prompt_event(
+        &mut self,
+        control: &mut Client,
+        shared: &Shared,
+        event: rexrs::Event,
+    ) -> Result<()> {
+        if let Some(deadline) = self
+            .prompts
+            .event(control, shared, self.prompts_enabled, event)
+            .await?
+        {
+            self.actions.promote(deadline);
+        }
+        Ok(())
+    }
+
     fn add_tickets(&mut self, tickets: Vec<session::DataTicket>, started: Instant) {
         for ticket in tickets {
             if ticket.data_ref_id != "terminal"
@@ -845,6 +874,7 @@ impl Shared {
             m.connected = connected;
             if !connected {
                 m.clipboard = None;
+                m.prompt_events.clear();
                 m.keymap = None;
                 m.keymap_revision += 1;
             }
@@ -1475,6 +1505,38 @@ fn apply_bootstrap(
     state.add_tickets(boot.data_tickets, started);
 }
 
+/// Take directed prompt events even if the server has not answered bootstrap yet.
+/// Other events still go through the normal post-bootstrap sequence cutoff.
+async fn bootstrap(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    boot: session::Bootstrap,
+    queued: &mut VecDeque<rexrs::Event>,
+) -> Result<rexrs::Reply<session::BootstrapResponse>> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut response = control
+            .transport()
+            .detach(session::Bootstrap::NAME, boot)
+            .await?;
+        loop {
+            tokio::select! {
+                biased;
+                reply = &mut response => return Ok(transport::detached_result_with_seq(&reply?)?),
+                event = control.next_event() => {
+                    let event = event?;
+                    if prompt::PromptState::is_event(&event) {
+                        state.prompt_event(control, shared, event).await?;
+                    } else {
+                        queued.push_back(event);
+                    }
+                }
+            }
+        }
+    })
+    .await?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: rexrs::Event,
@@ -1492,11 +1554,8 @@ async fn handle_event(
     if event.name == "client_perform_requested" {
         return perform::receive(control, shared, event.payload, state.performs_since).await;
     }
-    if event.name == "client_prompt_requested" {
-        return prompt::receive(control, event.payload).await;
-    }
-    if event.name == "client_prompt_ended" {
-        return Ok(());
+    if prompt::PromptState::is_event(&event) {
+        return state.prompt_event(control, shared, event).await;
     }
     // Config-wide and server-wide events have no session sequence. Do not broaden includes().
     if event.name == "keymap_changed" {
@@ -1822,6 +1881,8 @@ async fn run_host(
     let mut token: Option<String> = None;
     let mut workers = HashMap::<String, PaneWorker>::new();
     let mut retry = 0;
+    let mut prompts_enabled = false;
+    let mut deferred_commands = VecDeque::new();
     let mut prefetch = prefetch::Prefetch::default();
     let mut keymap: Option<Box<keymap::Declaration>> = None;
     let mut server_reads = server_info::Reader::default();
@@ -1870,6 +1931,7 @@ async fn run_host(
             shared.update(|m| {
                 m.connection_epoch += 1;
                 m.performs.clear();
+                m.prompt_events.clear();
                 m.view_fetches.clear();
                 m.client_id = identity.id.clone();
                 m.protocol.api_revision = control.welcome().api_revision;
@@ -1895,26 +1957,23 @@ async fn run_host(
                 m.activity_reading = true;
                 m.activity_incomplete = false;
             });
-            let mut state = ControlState::default();
+            let mut state = ControlState { prompts_enabled, ..Default::default() };
             let mut sweep = status_sweep::Reader::default();
             let mut downloads = downloads::Downloads::default();
             let mut busy_since = Some(Instant::now());
             let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
             let started = Instant::now();
             shared.update(|m| m.protocol.bootstrap_requests += 1);
-            let result = tokio::time::timeout(Duration::from_secs(8), control.call_with_seq(boot)).await;
+            let mut deferred_events = VecDeque::new();
+            let result = bootstrap(&mut control, shared, &mut state, boot, &mut deferred_events).await;
             let reply = match result {
-                Ok(Ok(reply)) => reply,
-                error => {
+                Ok(reply) => reply,
+                Err(error) => {
                     // Setup may be partially applied. A graceful close ends the identity;
                     // never reuse its token or continue this partially initialized socket.
                     token = None;
                     let _ = tokio::time::timeout(Duration::from_secs(2), control.close()).await;
-                    return match error {
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(error) => Err(error.into()),
-                        _ => unreachable!(),
-                    };
+                    return Err(error);
                 }
             };
             apply_bootstrap(shared, &mut state, reply, started);
@@ -1952,8 +2011,8 @@ async fn run_host(
             state.performs_since = busy_since;
             server_reads.reset();
             hosts_reads.reset();
-            let queued: Vec<_> = control.drain_events().collect();
-            for event in queued {
+            deferred_events.extend(control.drain_events());
+            while let Some(event) = deferred_events.pop_front() {
                 handle_event(
                     event,
                     &mut control,
@@ -1990,13 +2049,20 @@ async fn run_host(
             pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut expiry = tokio::time::interval(Duration::from_millis(100));
             loop {
+                let exclusive = state.actions.exclusive();
                 state.performs_since = state.performs_since.or(busy_since.take());
-                if state.performs_since.is_some() {
+                if !exclusive && (state.performs_since.is_some() || !deferred_events.is_empty()) {
                     // Buffered requests share the busy step's start, even when it took less
                     // than MAX_WAIT. They must not gain another five seconds in the UI queue.
                     use futures_util::FutureExt;
-                    if let Some(event) = control.next_event().now_or_never() {
+                    if let Some(event) = deferred_events.pop_front().map(Ok)
+                        .or_else(|| control.next_event().now_or_never())
+                    {
                         let event = event?;
+                        if prompt::PromptState::is_event(&event) {
+                            state.prompt_event(&mut control, shared, event).await?;
+                            continue;
+                        }
                         handle_event(
                             event,
                             &mut control,
@@ -2017,11 +2083,13 @@ async fn run_host(
                     }
                     state.performs_since = None;
                 }
-                let next = status_sweep::next(shared, &state);
+                let next = (!exclusive).then(|| status_sweep::next(shared, &state)).flatten();
                 let out = sweep.in_flight() + usize::from(prefetch.in_flight());
-                status_sweep::coverage(shared, &state, next.is_some() || out > 0);
+                if !exclusive {
+                    status_sweep::coverage(shared, &state, next.is_some() || out > 0);
+                }
                 // A few reads at once, at most one of them a layout; starts stay paced.
-                let room = out < status_sweep::IN_FLIGHT;
+                let room = !exclusive && out < status_sweep::IN_FLIGHT;
                 let due = match &next {
                     Some(status_sweep::Work::Status(..)) => room.then(Instant::now),
                     Some(status_sweep::Work::View(_)) => {
@@ -2034,8 +2102,23 @@ async fn run_host(
                 };
                 tokio::select! {
                     _ = expiry.tick() => {
+                        state.prompts.expire(shared);
+                        if exclusive { continue; }
                         busy_since = Some(Instant::now());
                         perform::expire(&mut control, shared).await?;
+                    }
+                    result = state.actions.finished(shared) => {
+                        if let Err(error) = result {
+                            shared.update(|m| m.notice = Some(format!("{error:#}")));
+                            if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) { return Err(error); }
+                        }
+                    }
+                    result = state.prompts.finished() => {
+                        if matches!(result, Err(rexrs::Error::Transport(_) | rexrs::Error::Closed { .. })) {
+                            result?;
+                        } else {
+                            state.prompts.record(shared, result);
+                        }
                     }
                     _ = prefetch::wait(&mut pace, due.unwrap_or_else(Instant::now)), if due.is_some() => {
                         busy_since = Some(Instant::now());
@@ -2060,7 +2143,7 @@ async fn run_host(
                             }
                         }
                     }
-                    (id, text) = prefetch.finished(), if prefetch.in_flight() => {
+                    (id, text) = prefetch.finished(), if !exclusive && prefetch.in_flight() => {
                         state.view_reading = None;
                         let stale = std::mem::take(&mut state.view_stale);
                         if let Some((seq, view)) = prefetch.result(&id, text, Instant::now()) {
@@ -2084,14 +2167,14 @@ async fn run_host(
                             }
                         }
                     }
-                    (session, block, reply) = sweep.finished(), if sweep.in_flight() > 0 => {
+                    (session, block, reply) = sweep.finished(), if !exclusive && sweep.in_flight() > 0 => {
                         let removed = state.status_reading.remove(&block).unwrap_or_default();
                         status_sweep::record(shared, &mut state, &session, &block, reply, &removed);
                     }
-                    reply = server_reads.finished(), if server_reads.in_flight() => server_info::record(shared, reply),
-                    reply = hosts_reads.finished(), if hosts_reads.in_flight() => hosts::record(shared, reply),
-                    _ = directory_reads.finished(shared), if directory_reads.in_flight() => {}
-                    fetched = view_fetches.finished(), if view_fetches.in_flight() => {
+                    reply = server_reads.finished(), if !exclusive && server_reads.in_flight() => server_info::record(shared, reply),
+                    reply = hosts_reads.finished(), if !exclusive && hosts_reads.in_flight() => hosts::record(shared, reply),
+                    _ = directory_reads.finished(shared), if !exclusive && directory_reads.in_flight() => {}
+                    fetched = view_fetches.finished(), if !exclusive && view_fetches.in_flight() => {
                         match fetched {
                             view_fetch::Event::Reply { session, ids, result: Ok((seq, view)) } => {
                                 if !view_fetches.reading(&session) {
@@ -2150,8 +2233,16 @@ async fn run_host(
                         }
                     }
                     event = control.next_event() => {
-                        busy_since = Some(Instant::now());
                         let event = event?;
+                        if prompt::PromptState::is_event(&event) {
+                            state.prompt_event(&mut control, shared, event).await?;
+                            continue;
+                        }
+                        if exclusive {
+                            deferred_events.push_back(event);
+                            continue;
+                        }
+                        busy_since = Some(Instant::now());
                         handle_event(
                             event,
                             &mut control,
@@ -2170,11 +2261,37 @@ async fn run_host(
                         query_activity(&mut control, shared, &mut state).await;
                     }
                     error = crate::ssh::closed(&mut tunnel) => return Err(error),
-                    command = commands.recv_async() => {
-                        busy_since = Some(Instant::now());
+                    command = async {
+                        if !exclusive && let Some(command) = deferred_commands.pop_front() {
+                            Ok(command)
+                        } else {
+                            commands.recv_async().await
+                        }
+                    } => {
                         let Ok(command) = command else { control.close().await?; return Ok(true); };
                         if matches!(command, HostCommand::Shutdown) { control.close().await?; return Ok(true); }
                         if matches!(command, HostCommand::Reconnect) { return Ok(false); }
+                        if let HostCommand::Prompts(enabled) = command {
+                            prompts_enabled = enabled;
+                            state.prompts_enabled = enabled;
+                            if !enabled { state.prompts.disable(&mut control, shared).await?; }
+                            continue;
+                        }
+                        if let HostCommand::PromptReply { epoch, call_id, answer } = command {
+                            state.prompts.answer(&mut control, shared, epoch, call_id, answer).await?;
+                            continue;
+                        }
+                        if exclusive {
+                            deferred_commands.push_back(command);
+                            continue;
+                        }
+                        busy_since = Some(Instant::now());
+                        if let HostCommand::Action { generation, request } = command {
+                            state.prompts.expire(shared);
+                            let prompt_deadline = state.prompts.deadline();
+                            state.actions.start(&mut control, shared, generation, *request, prompt_deadline).await?;
+                            continue;
+                        }
                         if let HostCommand::SshAgent { socket, .. } = command {
                             ssh_auth_sock = socket;
                             continue;
@@ -2377,6 +2494,8 @@ async fn run_host(
         }.await;
         tunnel = None;
         if matches!(result, Ok(true)) {
+            deferred_commands.clear();
+            shared.update(|m| m.prompt_events.clear());
             return Ok(());
         }
         shared.update(|m| {
@@ -2394,86 +2513,58 @@ async fn run_host(
             },
             false,
         );
-        retry += 1;
-        let delay = tokio::time::sleep(Duration::from_secs((1_u64 << retry.min(3)).min(8)));
-        tokio::pin!(delay);
+        let mut retry_now = false;
+        let mut delay = None;
         loop {
-            tokio::select! {
-                _ = &mut delay => break,
-                command = commands.recv_async() => match command {
-                    Ok(HostCommand::Shutdown) | Err(_) => return Ok(()),
-                    Ok(HostCommand::Reconnect) => break,
-                    Ok(HostCommand::SshAgent { socket, wake_auth_retry }) => {
-                        ssh_auth_sock = socket;
-                        let auth_failed = shared
-                            .model
-                            .lock()
-                            .expect("host model")
-                            .ssh_problem
-                            == Some(crate::ssh::Problem::AuthFailed);
-                        if wake_auth_retry && ssh.is_some() && auth_failed {
-                            retry = 0;
-                            break;
-                        }
+            // Settle the older, deferred work before reading newer commands or starting
+            // the retry timer. Drain the channel again at the end so nothing is replayed.
+            let (command, in_backoff) = if let Some(command) = deferred_commands.pop_front() {
+                (command, false)
+            } else if retry_now {
+                let Ok(command) = commands.try_recv() else {
+                    break;
+                };
+                (command, false)
+            } else {
+                let delay = delay.get_or_insert_with(|| {
+                    retry += 1;
+                    Box::pin(tokio::time::sleep(Duration::from_secs(
+                        (1_u64 << retry.min(3)).min(8),
+                    )))
+                });
+                tokio::select! {
+                    _ = delay => {
+                        retry_now = true;
+                        continue;
                     }
-                    Ok(HostCommand::Select(id)) => preferred = Some(id),
-                    Ok(HostCommand::Navigate { id, .. }) => reject_navigation(shared, id),
-                    Ok(HostCommand::Visibility(visible)) => shared.update(|m|m.visible=visible),
-                    Ok(HostCommand::PrefetchViews(sessions)) => prefetch.set_eligible(sessions),
-                    Ok(HostCommand::Theme(new)) => theme = new,
-                    Ok(HostCommand::Keymap(new)) => keymap = Some(new),
-                    Ok(HostCommand::Identify) => server_reads.want(),
-                    Ok(HostCommand::WatchSharedHosts) => hosts_reads.want(),
-                    Ok(HostCommand::PutSharedHost { id, epoch, .. }) => hosts::reject_write(
-                        shared,
-                        id,
-                        epoch,
-                        hosts::WriteKind::Put,
-                        "disconnected",
-                        "Shared host change not sent while disconnected. Try again after reconnecting.",
-                    ),
-                    Ok(HostCommand::RemoveSharedHost { id, epoch, .. }) => hosts::reject_write(
-                        shared,
-                        id,
-                        epoch,
-                        hosts::WriteKind::Remove,
-                        "disconnected",
-                        "Shared host removal not sent while disconnected. Try again after reconnecting.",
-                    ),
-                    Ok(HostCommand::Ticket { reply, .. }) => { let _ = reply.send(Err("Host is reconnecting".into())); }
-                    Ok(
-                        HostCommand::Claim { .. }
-                        | HostCommand::PerformReply { .. }
-                        | HostCommand::FetchView { .. },
-                    ) => {}
-                    Ok(HostCommand::ListDir(request)) => directory::finish(shared, &request, Err(directory::Failure::Disconnected)),
-                    Ok(HostCommand::Download(request)) => downloads::refuse(shared, *request, crate::download::Failure::Disconnected),
-                    Ok(HostCommand::DownloadConfirm(_) | HostCommand::DownloadCancel(_)) => {}
-                    Ok(HostCommand::Terminal { block, command: Command::Selection(input), .. }) => {
-                        if let Some(worker) = workers.get(&block) { let _ = worker.commands.send(DataCommand::Selection(input)); }
+                    command = commands.recv_async() => {
+                        let Ok(command) = command else { return Ok(()); };
+                        (command, true)
                     }
-                    Ok(HostCommand::Terminal { block, command: Command::Resize(a,b,c,d), .. }) => {
-                        if let Some(worker) = workers.get_mut(&block) { worker.size = Some((a,b,c,d)); }
-                    }
-                    Ok(HostCommand::Terminal { block, command, .. }) if forward_search(&workers, &block, &command) => {}
-                    Ok(HostCommand::ResizeLayer { .. }) => shared.update(|m| {
-                        m.notice = Some(crate::layers::Blocked::NotConnected.sentence());
-                    }),
-                    Ok(_) => shared.update(|m| m.notice = Some("Action not sent while disconnected. Try it again after reconnecting.".into())),
                 }
-            }
-        }
-        // Discard input already queued before a failure; never replay it after reconnect.
-        while let Ok(command) = commands.try_recv() {
+            };
             match command {
                 HostCommand::Shutdown => return Ok(()),
+                HostCommand::Reconnect => retry_now = true,
                 HostCommand::Select(id) => preferred = Some(id),
                 HostCommand::Navigate { id, .. } => reject_navigation(shared, id),
                 HostCommand::Visibility(visible) => shared.update(|m| m.visible = visible),
                 HostCommand::PrefetchViews(sessions) => prefetch.set_eligible(sessions),
                 HostCommand::Theme(new) => theme = new,
-                HostCommand::SshAgent { socket, .. } => ssh_auth_sock = socket,
+                HostCommand::SshAgent { socket, wake_auth_retry } => {
+                    ssh_auth_sock = socket;
+                    if in_backoff
+                        && wake_auth_retry
+                        && ssh.is_some()
+                        && shared.model.lock().expect("host model").ssh_problem
+                            == Some(crate::ssh::Problem::AuthFailed)
+                    {
+                        retry = 0;
+                        retry_now = true;
+                    }
+                }
                 HostCommand::Keymap(new) => keymap = Some(new),
+                HostCommand::Prompts(enabled) => prompts_enabled = enabled,
                 HostCommand::Identify => server_reads.want(),
                 HostCommand::WatchSharedHosts => hosts_reads.want(),
                 HostCommand::PutSharedHost { id, epoch, .. } => hosts::reject_write(
@@ -2482,7 +2573,11 @@ async fn run_host(
                     epoch,
                     hosts::WriteKind::Put,
                     "disconnected",
-                    "Shared host change not sent: the connection dropped first. Try again after reconnecting.",
+                    if in_backoff {
+                        "Shared host change not sent while disconnected. Try again after reconnecting."
+                    } else {
+                        "Shared host change not sent: the connection dropped first. Try again after reconnecting."
+                    },
                 ),
                 HostCommand::RemoveSharedHost { id, epoch, .. } => hosts::reject_write(
                     shared,
@@ -2490,14 +2585,27 @@ async fn run_host(
                     epoch,
                     hosts::WriteKind::Remove,
                     "disconnected",
-                    "Shared host removal not sent: the connection dropped first. Try again after reconnecting.",
+                    if in_backoff {
+                        "Shared host removal not sent while disconnected. Try again after reconnecting."
+                    } else {
+                        "Shared host removal not sent: the connection dropped first. Try again after reconnecting."
+                    },
                 ),
                 HostCommand::Ticket { reply, .. } => {
                     let _ = reply.send(Err("Host is reconnecting".into()));
                 }
-                HostCommand::Terminal { block, command, .. } => {
-                    forward_search(&workers, &block, &command);
+                HostCommand::Terminal { block, command: Command::Selection(input), .. } if in_backoff => {
+                    if let Some(worker) = workers.get(&block) {
+                        let _ = worker.commands.send(DataCommand::Selection(input));
+                    }
                 }
+                HostCommand::Terminal { block, command: Command::Resize(a,b,c,d), .. } if in_backoff => {
+                    if let Some(worker) = workers.get_mut(&block) {
+                        worker.size = Some((a,b,c,d));
+                    }
+                }
+                HostCommand::Terminal { block, command, .. }
+                    if forward_search(&workers, &block, &command) => {}
                 HostCommand::ListDir(request) => {
                     directory::finish(shared, &request, Err(directory::Failure::Disconnected))
                 }
@@ -2506,7 +2614,7 @@ async fn run_host(
                 }
                 // Confirmed, but the connection failed before it was read: say so, since
                 // the dialog has already closed.
-                HostCommand::StopServer { .. } => shared.update(|m| {
+                HostCommand::StopServer { .. } if !in_backoff => shared.update(|m| {
                     m.notice = Some(
                         "Stop not sent: the connection dropped first. Check the host before trying again. Nothing was retried."
                             .into(),
@@ -2515,6 +2623,15 @@ async fn run_host(
                 }),
                 HostCommand::ResizeLayer { .. } => shared.update(|m| {
                     m.notice = Some(crate::layers::Blocked::NotConnected.sentence());
+                }),
+                HostCommand::Claim { .. }
+                | HostCommand::PerformReply { .. }
+                | HostCommand::PromptReply { .. }
+                | HostCommand::FetchView { .. }
+                | HostCommand::DownloadConfirm(_)
+                | HostCommand::DownloadCancel(_) => {}
+                _ if in_backoff => shared.update(|m| {
+                    m.notice = Some("Action not sent while disconnected. Try it again after reconnecting.".into());
                 }),
                 _ => {}
             }
@@ -2653,10 +2770,6 @@ async fn handle_command(
     theme: &mut Option<SetTheme>,
 ) -> Result<()> {
     match command {
-        HostCommand::Action {
-            generation,
-            request,
-        } => actions::run(control, shared, generation, *request).await?,
         HostCommand::PerformReply {
             epoch,
             call_id,
@@ -2953,6 +3066,9 @@ async fn handle_command(
             }
         }
         HostCommand::ListDir(_)
+        | HostCommand::Action { .. }
+        | HostCommand::Prompts(_)
+        | HostCommand::PromptReply { .. }
         | HostCommand::Reconnect
         | HostCommand::SshAgent { .. }
         | HostCommand::Shutdown
