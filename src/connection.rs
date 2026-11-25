@@ -21,6 +21,7 @@ pub mod directory;
 pub mod downloads;
 pub mod focus_history;
 pub mod hosts;
+mod input;
 pub mod ports;
 mod prefetch;
 pub mod server_info;
@@ -1594,7 +1595,41 @@ fn view_blocks(view: &session::ViewResponse) -> impl Iterator<Item = String> + '
 /// and which program runs in it. Streamed blocks also need this one initial process read:
 /// older process_changed events omit home. Never poll or prefetch other sessions for titles.
 /// A failed query leaves the block without activity; it isn't retried.
-async fn query_activity(control: &mut Client, shared: &Shared, state: &mut ControlState) {
+///
+/// Requests are pipelined per chunk (preserving per-block `program_status`, `title`, `process`
+/// order on the wire) so multi-pane sessions pay one round trip instead of `3 * N`.
+async fn query_activity(
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    deferred_events: &mut VecDeque<rexrs::Event>,
+) {
+    enum MetaKind {
+        Status(String),
+        Title(String),
+        Process(String),
+    }
+    struct PendingMeta {
+        kind: MetaKind,
+        reply: tokio::sync::oneshot::Receiver<String>,
+        deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+    async fn next_reply(pending: &mut [PendingMeta]) -> (usize, Option<String>) {
+        use std::{future::Future, pin::Pin, task::Poll};
+        std::future::poll_fn(|cx| {
+            for (index, item) in pending.iter_mut().enumerate() {
+                if let Poll::Ready(reply) = Pin::new(&mut item.reply).poll(cx) {
+                    return Poll::Ready((index, reply.ok()));
+                }
+                if item.deadline.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready((index, None));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     let (session, blocks) = {
         let m = shared.model.lock().expect("host model");
         if !m.connected {
@@ -1609,28 +1644,125 @@ async fn query_activity(control: &mut Client, shared: &Shared, state: &mut Contr
             .collect();
         (session, blocks)
     };
-    for block in blocks {
-        state.queried.insert(block.clone());
-        let target = json!({"session_id":session, "block_id":block, "args":{}});
-        let method = format!("{}.program_status", activity::TERMINAL);
-        if state.status_queried.insert(block.clone()) {
-            let reply = request(control, &method, target.clone()).await.ok();
-            // Awaited: events that arrive meanwhile are applied after this, in order.
-            status_sweep::record(shared, state, &session, &block, reply, &HashSet::new());
-        }
-        let method = format!("{}.title", activity::TERMINAL);
-        if let Ok(reply) = request(control, &method, target.clone()).await {
-            let title = activity::parse_title(&reply);
-            shared.update(|m| m.apply_block_event(&session, block.clone(), title));
-        }
-        let method = format!("{}.process", activity::TERMINAL);
-        // Best-effort metadata must not hold up attachment or input for the normal
+    if blocks.is_empty() {
+        return;
+    }
+
+    let status_method = format!("{}.program_status", activity::TERMINAL);
+    let title_method = format!("{}.title", activity::TERMINAL);
+    let process_method = format!("{}.process", activity::TERMINAL);
+    let mut transport_failed = false;
+
+    for chunk in blocks.chunks(8) {
+        let mut pending = Vec::with_capacity(chunk.len() * 3);
+        let now = Instant::now();
+        let long_deadline = tokio::time::Instant::from_std(now + Duration::from_secs(8));
+        // Best-effort process metadata must not hold up attachment or input for the normal
         // eight-second request timeout. Events continue to refresh it afterward.
-        if let Ok(Ok(reply)) =
-            tokio::time::timeout(Duration::from_secs(1), control.call_raw(&method, target)).await
-        {
-            let process = activity::parse_process(&reply);
-            shared.update(|m| m.apply_block_event(&session, block, process));
+        let short_deadline = tokio::time::Instant::from_std(now + Duration::from_secs(1));
+
+        for block in chunk {
+            state.queried.insert(block.clone());
+            let target = json!({"session_id":session, "block_id":block, "args":{}});
+            if state.status_queried.insert(block.clone()) {
+                match control
+                    .transport()
+                    .detach(&status_method, target.clone())
+                    .await
+                {
+                    Ok(reply) => pending.push(PendingMeta {
+                        kind: MetaKind::Status(block.clone()),
+                        reply,
+                        deadline: Box::pin(tokio::time::sleep_until(long_deadline)),
+                    }),
+                    Err(_) => {
+                        status_sweep::record(shared, state, &session, block, None, &HashSet::new());
+                        transport_failed = true;
+                        break;
+                    }
+                }
+            }
+            match control
+                .transport()
+                .detach(&title_method, target.clone())
+                .await
+            {
+                Ok(reply) => pending.push(PendingMeta {
+                    kind: MetaKind::Title(block.clone()),
+                    reply,
+                    deadline: Box::pin(tokio::time::sleep_until(long_deadline)),
+                }),
+                Err(_) => {
+                    transport_failed = true;
+                    break;
+                }
+            }
+            match control.transport().detach(&process_method, target).await {
+                Ok(reply) => pending.push(PendingMeta {
+                    kind: MetaKind::Process(block.clone()),
+                    reply,
+                    deadline: Box::pin(tokio::time::sleep_until(short_deadline)),
+                }),
+                Err(_) => {
+                    transport_failed = true;
+                    break;
+                }
+            }
+        }
+
+        while !pending.is_empty() && !transport_failed {
+            tokio::select! {
+                biased;
+                (index, text) = next_reply(&mut pending) => {
+                    let item = pending.remove(index);
+                    let reply = text.and_then(|t| transport::detached_result::<Value>(&t).ok());
+                    match item.kind {
+                        MetaKind::Status(block) => {
+                            // Awaited before deferred events: events arriving meanwhile apply after.
+                            status_sweep::record(
+                                shared,
+                                state,
+                                &session,
+                                &block,
+                                reply,
+                                &HashSet::new(),
+                            );
+                        }
+                        MetaKind::Title(block) => {
+                            if let Some(reply) = reply {
+                                let title = activity::parse_title(&reply);
+                                shared.update(|m| m.apply_block_event(&session, block, title));
+                            }
+                        }
+                        MetaKind::Process(block) => {
+                            if let Some(reply) = reply {
+                                let process = activity::parse_process(&reply);
+                                shared.update(|m| m.apply_block_event(&session, block, process));
+                            }
+                        }
+                    }
+                }
+                event = control.next_event() => match event {
+                    Ok(event) => {
+                        if prompt::PromptState::is_event(&event) {
+                            if state.prompt_event(control, shared, event).await.is_err() {
+                                transport_failed = true;
+                            }
+                        } else {
+                            deferred_events.push_back(event);
+                        }
+                    }
+                    Err(_) => transport_failed = true,
+                }
+            }
+        }
+        if transport_failed {
+            for item in pending {
+                if let MetaKind::Status(block) = item.kind {
+                    status_sweep::record(shared, state, &session, &block, None, &HashSet::new());
+                }
+            }
+            return;
         }
     }
 }
@@ -1646,13 +1778,14 @@ async fn declare_themes(
     state: &mut ControlState,
     workers: &HashMap<String, PaneWorker>,
     theme: Option<&SetTheme>,
+    deferred_events: &mut VecDeque<rexrs::Event>,
 ) {
-    let due: Vec<_> = {
+    let (already_supported, due) = {
         let m = shared.model.lock().expect("host model");
         if m.themes_unsupported || !m.connected {
             return;
         }
-        workers
+        let due: Vec<_> = workers
             .iter()
             .filter_map(|(block, worker)| {
                 let last = state.themed.get(block);
@@ -1664,27 +1797,114 @@ async fn declare_themes(
                 (last != Some(&wanted) && m.themable(&worker.session, block))
                     .then(|| (worker.session.clone(), block.clone(), wanted))
             })
-            .collect()
+            .collect();
+        (m.theme_declared, due)
     };
-    for (session, block, wanted) in due {
-        let call = control.call(wanted.clone().on(session, block.clone()));
-        match tokio::time::timeout(Duration::from_secs(8), call).await {
-            Ok(Err(rexrs::Error::Api(
-                rexrs::ApiError::MethodNotFound { .. } | rexrs::ApiError::NotSupported { .. },
-            ))) => {
-                shared.update(|m| {
+    if due.is_empty() {
+        return;
+    }
+
+    let apply_outcome = |shared: &Shared,
+                         state: &mut ControlState,
+                         block: String,
+                         wanted: SetTheme,
+                         unsupported: bool| {
+        if unsupported {
+            shared.update(|m| {
+                if !m.themes_unsupported {
                     m.themes_unsupported = true;
                     m.notice = Some(
                         "This Rex server doesn't take terminal themes; its panes keep the server's colours."
                             .into(),
                     );
-                });
-                return;
+                }
+            });
+        } else {
+            state.themed.insert(block, wanted);
+            shared.update(|m| m.theme_declared = true);
+        }
+    };
+
+    let mut rest = due.into_iter();
+    // Probe one block first until this host is known to accept `set_theme`, so an older server
+    // receives at most one refusal and never a burst of unsupported calls.
+    if !already_supported && let Some((session, block, wanted)) = rest.next() {
+        let call = control.call(wanted.clone().on(session, block.clone()));
+        let unsupported = matches!(
+            tokio::time::timeout(Duration::from_secs(8), call).await,
+            Ok(Err(rexrs::Error::Api(
+                rexrs::ApiError::MethodNotFound { .. } | rexrs::ApiError::NotSupported { .. },
+            )))
+        );
+        apply_outcome(shared, state, block, wanted, unsupported);
+        if unsupported {
+            return;
+        }
+    }
+
+    struct PendingTheme {
+        block: String,
+        wanted: SetTheme,
+        reply: tokio::sync::oneshot::Receiver<String>,
+        deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+    async fn next_reply(pending: &mut [PendingTheme]) -> (usize, Option<String>) {
+        use std::{future::Future, pin::Pin, task::Poll};
+        std::future::poll_fn(|cx| {
+            for (index, item) in pending.iter_mut().enumerate() {
+                if let Poll::Ready(reply) = Pin::new(&mut item.reply).poll(cx) {
+                    return Poll::Ready((index, reply.ok()));
+                }
+                if item.deadline.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready((index, None));
+                }
             }
-            // A block that closed meanwhile or a slow reply isn't retried on this connection.
-            _ => {
-                state.themed.insert(block, wanted);
-                shared.update(|m| m.theme_declared = true);
+            Poll::Pending
+        })
+        .await
+    }
+
+    let mut pending = Vec::new();
+    let deadline = tokio::time::Instant::from_std(Instant::now() + Duration::from_secs(8));
+    for (session, block, wanted) in rest {
+        let request = wanted.clone().on(session, block.clone());
+        match control.transport().detach(SetTheme::NAME, request).await {
+            Ok(reply) => pending.push(PendingTheme {
+                block,
+                wanted,
+                reply,
+                deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            }),
+            Err(_) => break,
+        }
+    }
+    while !pending.is_empty() {
+        tokio::select! {
+            biased;
+            (index, text) = next_reply(&mut pending) => {
+                let item = pending.remove(index);
+                let unsupported = text.is_some_and(|t| {
+                    matches!(
+                        transport::detached_result::<Value>(&t),
+                        Err(rexrs::Error::Api(
+                            rexrs::ApiError::MethodNotFound { .. }
+                                | rexrs::ApiError::NotSupported { .. },
+                        ))
+                    )
+                });
+                apply_outcome(shared, state, item.block, item.wanted, unsupported);
+            }
+            event = control.next_event() => match event {
+                Ok(event) => {
+                    if prompt::PromptState::is_event(&event) {
+                        if state.prompt_event(control, shared, event).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        deferred_events.push_back(event);
+                    }
+                }
+                Err(_) => break,
             }
         }
     }
@@ -2260,6 +2480,7 @@ async fn run_host(
             let mut state = ControlState { prompts_enabled, ..Default::default() };
             let mut sweep = status_sweep::Reader::default();
             let mut downloads = downloads::Downloads::default();
+            let mut inputs = input::Queue::default();
             let mut busy_since = Some(Instant::now());
             let boot = bootstrap_request(wanted.as_deref(), create.is_some(), workers.values().map(|w| w.session.clone()));
             let started = Instant::now();
@@ -2331,11 +2552,22 @@ async fn run_host(
             shared.status("Connected", true);
             reconcile(&endpoint, shared, &sender, &mut workers);
             for (block, worker) in &workers {
-                if let Some((cols, rows, w, h)) = worker.size { resize(&mut control, &worker.session, block, cols, rows, w, h).await?; }
+                if let Some((cols, rows, w, h)) = worker.size {
+                    send_input(
+                        &mut inputs,
+                        &mut control,
+                        shared,
+                        &mut state,
+                        &mut deferred_events,
+                        "com.superlogical.terminal.resize",
+                        resize_payload(&worker.session, block, cols, rows, w, h),
+                    )
+                    .await?;
+                }
             }
             reconcile(&endpoint, shared, &sender, &mut workers);
-            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-            query_activity(&mut control, shared, &mut state).await;
+            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
+            query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
             // Restore terminal sizes and state before a best-effort keymap can wait.
             if let Some(declaration) = &keymap { keymap::refresh(&mut control, shared, declaration).await; }
             server_reads.start(&mut control).await?;
@@ -2377,8 +2609,8 @@ async fn run_host(
                         .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
-                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                        query_activity(&mut control, shared, &mut state).await;
+                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
+                        query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                         continue;
                     }
                     state.performs_since = None;
@@ -2409,6 +2641,9 @@ async fn run_host(
                         if exclusive { continue; }
                         busy_since = Some(Instant::now());
                         perform::expire(&mut control, shared).await?;
+                    }
+                    result = inputs.finished(shared), if inputs.in_flight() > 0 => {
+                        result?;
                     }
                     result = state.actions.finished(shared) => {
                         if let Err(error) = result {
@@ -2564,8 +2799,8 @@ async fn run_host(
                         .await?;
                         state.prune(&shared.model.lock().expect("host model"));
                         reconcile(&endpoint, shared, &sender, &mut workers);
-                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                        query_activity(&mut control, shared, &mut state).await;
+                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
+                        query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                     }
                     error = crate::ssh::closed(&mut tunnel) => return Err(error),
                     command = async {
@@ -2575,7 +2810,7 @@ async fn run_host(
                             commands.recv_async().await
                         }
                     } => {
-                        let Ok(command) = command else { control.close().await?; return Ok(true); };
+                        let Ok(mut command) = command else { control.close().await?; return Ok(true); };
                         if matches!(command, HostCommand::Shutdown) { control.close().await?; return Ok(true); }
                         if matches!(command, HostCommand::Reconnect) { return Ok(false); }
                         if let HostCommand::Prompts(enabled) = command {
@@ -2592,7 +2827,10 @@ async fn run_host(
                             deferred_commands.push_back(command);
                             continue;
                         }
-                        busy_since = Some(Instant::now());
+                        let command_started = Instant::now();
+                        if !matches!(command, HostCommand::Terminal { .. }) {
+                            busy_since = Some(command_started);
+                        }
                         if let HostCommand::Action { generation, request } = command {
                             state.prompts.expire(shared);
                             let prompt_deadline = state.prompts.deadline();
@@ -2691,8 +2929,8 @@ async fn run_host(
                             }
                             state.prune(&shared.model.lock().expect("host model"));
                             reconcile(&endpoint, shared, &sender, &mut workers);
-                            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                            query_activity(&mut control, shared, &mut state).await;
+                            declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
+                            query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
                             continue;
                         }
                         if let HostCommand::Keymap(new) = command {
@@ -2808,20 +3046,57 @@ async fn run_host(
                         ) {
                             preferred = None;
                         }
+                        if let HostCommand::Terminal { session, block, command } = &mut command {
+                            coalesce_terminal_command(
+                                session,
+                                block,
+                                command,
+                                &mut deferred_commands,
+                                &commands,
+                            );
+                        }
                         let navigation = match &command { HostCommand::Navigate { id, .. } => Some(*id), _ => None };
-                        let outcome = handle_command(command, &mut control, shared, &mut workers, &mut state, &mut sweep, &mut theme).await;
-                        ports::reconcile_selected(shared, &mut state);
+                        let outcome = handle_command(
+                            command,
+                            &mut control,
+                            shared,
+                            &mut workers,
+                            &mut state,
+                            &mut sweep,
+                            &mut inputs,
+                            &mut deferred_events,
+                            &mut theme,
+                        )
+                        .await;
                         if let Some(id) = navigation {
                             shared.update(|m| m.navigation_result = Some((id, outcome.is_ok())));
                         }
-                        if let Err(error) = outcome {
-                            shared.update(|m| m.notice = Some(format!("{error:#}")));
-                            if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) { return Err(error); }
+                        let effect = match outcome {
+                            Ok(effect) => effect,
+                            Err(error) => {
+                                shared.update(|m| m.notice = Some(format!("{error:#}")));
+                                if !matches!(error.downcast_ref::<rexrs::Error>(), Some(rexrs::Error::Api(_))) { return Err(error); }
+                                CommandEffect::Full
+                            }
+                        };
+                        if effect != CommandEffect::None
+                            || command_started.elapsed() >= Duration::from_millis(5)
+                        {
+                            busy_since = Some(command_started);
                         }
-                        state.prune(&shared.model.lock().expect("host model"));
-                        reconcile(&endpoint, shared, &sender, &mut workers);
-                        declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref()).await;
-                        query_activity(&mut control, shared, &mut state).await;
+                        match effect {
+                            CommandEffect::None => {}
+                            CommandEffect::Claimed => {
+                                declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
+                            }
+                            CommandEffect::Full => {
+                                ports::reconcile_selected(shared, &mut state);
+                                state.prune(&shared.model.lock().expect("host model"));
+                                reconcile(&endpoint, shared, &sender, &mut workers);
+                                declare_themes(&mut control, shared, &mut state, &workers, theme.as_ref(), &mut deferred_events).await;
+                                query_activity(&mut control, shared, &mut state, &mut deferred_events).await;
+                            }
+                        }
                     }
                 }
             }
@@ -3178,6 +3453,103 @@ async fn undo_close(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandEffect {
+    /// Local pane forwarding or pipelined terminal input/resize: no layout or metadata changed.
+    None,
+    /// Input took size ownership of a block, which may make it newly eligible for `set_theme`.
+    Claimed,
+    /// Command may have changed sessions, views, workers, themes, or unqueried blocks.
+    Full,
+}
+
+fn is_mouse_motion(payload: &Value) -> bool {
+    payload["action"].as_str() == Some("motion")
+}
+
+/// Collapse consecutive queued `Resize` or identical-button/mods `Mouse(motion)` events for the
+/// same pane so a slow link never replays stale intermediate drag/resize states. Never reorders
+/// across any other command.
+fn coalesce_terminal_command(
+    session: &str,
+    block: &str,
+    command: &mut Command,
+    deferred: &mut VecDeque<HostCommand>,
+    incoming: &flume::Receiver<HostCommand>,
+) {
+    let coalescable = matches!(command, Command::Resize(..))
+        || matches!(command, Command::Mouse(payload) if is_mouse_motion(payload));
+    if !coalescable {
+        return;
+    }
+    loop {
+        if deferred.is_empty() {
+            let Ok(next) = incoming.try_recv() else {
+                break;
+            };
+            deferred.push_back(next);
+        }
+        let matches_next = match (&*command, deferred.front()) {
+            (
+                Command::Resize(..),
+                Some(HostCommand::Terminal {
+                    session: next_session,
+                    block: next_block,
+                    command: Command::Resize(..),
+                }),
+            ) => next_session == session && next_block == block,
+            (
+                Command::Mouse(current),
+                Some(HostCommand::Terminal {
+                    session: next_session,
+                    block: next_block,
+                    command: Command::Mouse(next_payload),
+                }),
+            ) => {
+                next_session == session
+                    && next_block == block
+                    && is_mouse_motion(next_payload)
+                    && next_payload.get("button") == current.get("button")
+                    && next_payload.get("mods") == current.get("mods")
+            }
+            _ => false,
+        };
+        if !matches_next {
+            break;
+        }
+        if let Some(HostCommand::Terminal { command: newer, .. }) = deferred.pop_front() {
+            *command = newer;
+        }
+    }
+}
+
+async fn send_input(
+    inputs: &mut input::Queue,
+    control: &mut Client,
+    shared: &Shared,
+    state: &mut ControlState,
+    deferred_events: &mut VecDeque<rexrs::Event>,
+    method: &str,
+    payload: Value,
+) -> Result<()> {
+    while inputs.is_full() {
+        tokio::select! {
+            biased;
+            result = inputs.finished(shared) => result?,
+            event = control.next_event() => {
+                let event = event?;
+                if prompt::PromptState::is_event(&event) {
+                    state.prompt_event(control, shared, event).await?;
+                } else {
+                    deferred_events.push_back(event);
+                }
+            }
+        }
+    }
+    inputs.send(control, shared, method, payload).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     command: HostCommand,
     control: &mut Client,
@@ -3185,8 +3557,10 @@ async fn handle_command(
     workers: &mut HashMap<String, PaneWorker>,
     state: &mut ControlState,
     sweep: &mut status_sweep::Reader,
+    inputs: &mut input::Queue,
+    deferred_events: &mut VecDeque<rexrs::Event>,
     theme: &mut Option<SetTheme>,
-) -> Result<()> {
+) -> Result<CommandEffect> {
     match command {
         HostCommand::PerformReply {
             epoch,
@@ -3202,7 +3576,7 @@ async fn handle_command(
         HostCommand::Theme(new) => *theme = new,
         HostCommand::Claim { session, blocks } => {
             if blocks.is_empty() {
-                return Ok(());
+                return Ok(CommandEffect::Full);
             }
             let Ok(result) = request(
                 control,
@@ -3211,7 +3585,7 @@ async fn handle_command(
             )
             .await
             else {
-                return Ok(());
+                return Ok(CommandEffect::Full);
             };
             shared.update(|m| {
                 for b in result["blocks"].as_array().into_iter().flatten() {
@@ -3361,7 +3735,7 @@ async fn handle_command(
                 if reply.send(Ok(ticket)).is_ok() {
                     shared.update(|m| m.protocol.bundled_tickets_used += 1);
                 }
-                return Ok(());
+                return Ok(CommandEffect::Full);
             }
             shared.update(|m| m.protocol.data_connect_requests += 1);
             let result = request(control, "data.connect", json!({"session_id":session,"block_id":block,"data_ref_id":"terminal","subprotocol":wire::PROTOCOL})).await;
@@ -3382,36 +3756,54 @@ async fn handle_command(
             command,
         } => {
             let Some(worker) = workers.get_mut(&block) else {
-                return Ok(());
+                return Ok(CommandEffect::None);
             };
             match command {
                 Command::Selection(input) => {
                     let _ = worker.commands.send(DataCommand::Selection(input));
+                    return Ok(CommandEffect::None);
                 }
                 Command::CopyMode(input) => {
                     let _ = worker.commands.send(DataCommand::CopyMode(input));
+                    return Ok(CommandEffect::None);
                 }
                 Command::Resize(cols, rows, w, h) => {
                     worker.size = Some((cols, rows, w, h));
-                    resize(control, &session, &block, cols, rows, w, h).await?;
+                    send_input(
+                        inputs,
+                        control,
+                        shared,
+                        state,
+                        deferred_events,
+                        "com.superlogical.terminal.resize",
+                        resize_payload(&session, &block, cols, rows, w, h),
+                    )
+                    .await?;
+                    return Ok(CommandEffect::None);
                 }
                 Command::Scroll(delta) => {
                     let _ = worker.commands.send(DataCommand::Scroll(delta));
+                    return Ok(CommandEffect::None);
                 }
                 Command::Search(needle) => {
                     let _ = worker.commands.send(DataCommand::Search(needle));
+                    return Ok(CommandEffect::None);
                 }
                 Command::SearchStep(older) => {
                     let _ = worker.commands.send(DataCommand::SearchStep(older));
+                    return Ok(CommandEffect::None);
                 }
                 Command::CursorStyle(shape) => {
                     let _ = worker.commands.send(DataCommand::CursorStyle(shape));
+                    return Ok(CommandEffect::None);
                 }
                 Command::PromptStep(older) => {
                     let _ = worker.commands.send(DataCommand::PromptStep(older));
+                    return Ok(CommandEffect::None);
                 }
                 Command::Reconnect => {
                     let _ = worker.commands.send(DataCommand::Reconnect);
+                    return Ok(CommandEffect::None);
                 }
                 // Neither is input: the block is not claimed. A refusal becomes the host's
                 // notice and a transport failure reconnects; either way it is not sent again.
@@ -3433,13 +3825,13 @@ async fn handle_command(
                     let (connected, owner) = {
                         let m = shared.model.lock().expect("host model");
                         let Some(connection) = m.terminals.get(&block) else {
-                            return Ok(());
+                            return Ok(CommandEffect::None);
                         };
                         let m = connection.model.lock().expect("terminal model");
                         (m.connected && m.control_connected, m.owner)
                     };
                     if !connected {
-                        return Ok(());
+                        return Ok(CommandEffect::None);
                     }
                     // Releases, pointer motion and wheel turns never claim the block; presses do.
                     let passive = match &input {
@@ -3450,6 +3842,7 @@ async fn handle_command(
                         Command::Wheel(_) => true,
                         _ => false,
                     };
+                    let mut claimed = false;
                     if !owner && !passive {
                         let result = request(
                             control,
@@ -3471,6 +3864,7 @@ async fn handle_command(
                                 }
                             }
                         });
+                        claimed = true;
                     }
                     // Typing, pasting and clicking return the view to the live screen; pointer
                     // motion, releases and wheel turns leave it (and its frame) alone.
@@ -3500,31 +3894,85 @@ async fn handle_command(
                     }
                     match input {
                         Command::Key(key) => {
-                            request(
+                            send_input(
+                                inputs,
                                 control,
+                                shared,
+                                state,
+                                deferred_events,
                                 "client.key",
                                 json!({"session_id":session,"block_id":block,"key":key}),
                             )
                             .await?;
                         }
                         Command::KeyWithPrefix { key, prefix } => {
-                            request(control, "client.key", json!({"session_id":session,"block_id":block,"key":key,"prefix":prefix})).await?;
+                            send_input(
+                                inputs,
+                                control,
+                                shared,
+                                state,
+                                deferred_events,
+                                "client.key",
+                                json!({"session_id":session,"block_id":block,"key":key,"prefix":prefix}),
+                            )
+                            .await?;
                         }
                         Command::SendKey(key) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"key","payload":key}})).await?;
+                            send_input(
+                                inputs,
+                                control,
+                                shared,
+                                state,
+                                deferred_events,
+                                "block.event",
+                                json!({"session_id":session,"block_id":block,"event":{"type":"key","payload":key}}),
+                            )
+                            .await?;
                         }
                         Command::Paste(text) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"paste","payload":{"text":text}}})).await?;
+                            send_input(
+                                inputs,
+                                control,
+                                shared,
+                                state,
+                                deferred_events,
+                                "block.event",
+                                json!({"session_id":session,"block_id":block,"event":{"type":"paste","payload":{"text":text}}}),
+                            )
+                            .await?;
                         }
                         Command::Mouse(payload) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"mouse","payload":payload}})).await?;
+                            send_input(
+                                inputs,
+                                control,
+                                shared,
+                                state,
+                                deferred_events,
+                                "block.event",
+                                json!({"session_id":session,"block_id":block,"event":{"type":"mouse","payload":payload}}),
+                            )
+                            .await?;
                         }
                         Command::Wheel(payload) => {
-                            request(control, "block.event", json!({"session_id":session,"block_id":block,"event":{"type":"wheel","payload":payload}})).await?;
+                            send_input(
+                                inputs,
+                                control,
+                                shared,
+                                state,
+                                deferred_events,
+                                "block.event",
+                                json!({"session_id":session,"block_id":block,"event":{"type":"wheel","payload":payload}}),
+                            )
+                            .await?;
                         }
                         Command::TakeControl => {}
                         _ => unreachable!(),
                     }
+                    return Ok(if claimed {
+                        CommandEffect::Claimed
+                    } else {
+                        CommandEffect::None
+                    });
                 }
             }
         }
@@ -3553,7 +4001,7 @@ async fn handle_command(
             unreachable!()
         }
     }
-    Ok(())
+    Ok(CommandEffect::Full)
 }
 
 /// The theme a block this client creates starts with, unless the server refused themes.
@@ -3564,17 +4012,8 @@ fn new_block_theme<'a>(shared: &Shared, theme: Option<&'a SetTheme>) -> Option<&
     theme
 }
 
-async fn resize(
-    control: &mut Client,
-    session: &str,
-    block: &str,
-    cols: u16,
-    rows: u16,
-    w: u16,
-    h: u16,
-) -> Result<()> {
-    request(control, "com.superlogical.terminal.resize", json!({"session_id":session,"block_id":block,"args":{"columns":cols,"rows":rows,"cell_width_px":w,"cell_height_px":h}})).await?;
-    Ok(())
+fn resize_payload(session: &str, block: &str, cols: u16, rows: u16, w: u16, h: u16) -> Value {
+    json!({"session_id":session,"block_id":block,"args":{"columns":cols,"rows":rows,"cell_width_px":w,"cell_height_px":h}})
 }
 
 fn fail_copy_mode(
